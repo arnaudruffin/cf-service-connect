@@ -17,7 +17,7 @@ Currently supports (most) service brokers for the following:
 
 ## Local installation
 
-1. Install the [Cloud Foundry CLI](https://docs.cloudfoundry.org/cf-cli/install-go-cli.html) v6.15.0 or later.
+1. Install the [Cloud Foundry CLI](https://docs.cloudfoundry.org/cf-cli/install-go-cli.html) v8.0.0 or later. See [CF CLI and CAPI compatibility](#cf-cli-and-capi-compatibility) for why v8 is required.
 2. Install this plugin, using the appropriate binary URL from [the Releases page](https://github.com/18F/cf-service-connect/releases).
 
     ```sh
@@ -29,6 +29,34 @@ Currently supports (most) service brokers for the following:
     ```
 
 3. Install the CLI corresponding to your service type (see above).
+
+## CF CLI and CAPI compatibility
+
+This plugin uses only **CAPI v3**, so it works on foundations where the v2 API
+has been disabled (`cc.temporary_enable_v2: false`, the default in
+cf-deployment since v47.0.0 — see [RFC-0032: CF API v2 EOL](https://github.com/cloudfoundry/community/blob/main/toc/rfc/rfc-0032-cfapiv2-eol.md)).
+
+Two consequences are worth knowing about:
+
+**CF CLI v8 is required.** The plugin itself needs very little from the CLI, but
+CF CLI v6 and v7 resolve their endpoints from `/v2/info`, so `cf login` and
+`cf target` do not work at all against a v2-disabled foundation. Requiring v8
+turns that into a clear message from the CLI rather than a confusing failure
+inside the plugin.
+
+**The plugin creates its own SSH tunnel.** Earlier versions shelled out to
+`cf ssh`. They cannot work on a v2-disabled foundation, because a plugin cannot
+reach the CLI's v3 code paths: `CliCommandWithoutTerminalOutput` and helpers such
+as `GetService` are dispatched through the CLI's *legacy* command registry, which
+is hard-wired to `/v2/*` endpoints even in CF CLI v8. The tunnel is now
+established in-process using the SSH proxy details from the CF API root document
+(the v3-era replacement for `/v2/info`).
+
+The plugin prefers the `app_ssh_ws` WebSocket endpoint when a foundation
+advertises one, per [RFC-0029: CF SSH over WebSockets](https://github.com/cloudfoundry/community/blob/main/toc/rfc/rfc-0029-ssh-over-ws.md),
+and falls back to the classic `app_ssh` TCP endpoint (port 2222) otherwise. This
+means the plugin keeps working on foundations that have closed port 2222.
+
 
 ## Usage
 
@@ -42,25 +70,28 @@ Currently supports (most) service brokers for the following:
 $ cf target --organization <org> --space <space>
 $ cf connect-to-service <app_name> <service_instance_name>
 Finding the service instance details...
+Creating the service key...
 Setting up SSH tunnel...
+SSH tunnel created: localhost:38421 -> <service-host>:5432
+Connecting client...
 ...
-mysql>
+psql>
 ```
 
-If you get an error such as "connection refused", "error opening SSH connection", or "psql: could not connect to server: Connection refused" this is usually caused by being on a network that blocks the SSH port that this tool is trying to use. Try using a different network, or consider asking your network administrator to unblock the port (typically 22 and/or 2222).
+If you get an error such as "connection refused", "error opening SSH connection", or "psql: could not connect to server: Connection refused" this is usually caused by being on a network that blocks the SSH port that this tool is trying to use. Try using a different network, or consider asking your network administrator to unblock the port (typically 22 and/or 2222). On foundations that advertise the `app_ssh_ws` endpoint the plugin tunnels SSH over `wss://` on port 443 instead, which avoids this class of problem.
 
 ### Optional: overriding `cf` CLI binary name
 
-If you are in Windows or another environment where the Cloud Foundry CLI was installed as `cf7` or `cf8`, you can set an environment to tell the plugin what binary name to use for the Cloud Foundry CLI:
+> **Note**
+> `CF_BINARY_NAME` no longer has any effect. This plugin creates the SSH tunnel
+> itself rather than running `cf ssh`, so no `cf` binary is invoked. The variable
+> is still accepted, and the plugin prints a notice when it is set, so existing
+> scripts keep working unchanged. You can remove it from your configuration.
+
+Previously, in Windows or another environment where the Cloud Foundry CLI was installed as `cf7` or `cf8`, this variable told the plugin which binary name to use:
 
 ```shell
 CF_BINARY_NAME=cf7 cf connect-to-service <app_name> <service_instance_name>
-```
-
-Or in PowerShell:
-```
-$env:CF_BINARY_NAME = "cf7";
-cf7 connect-to-service <app_name> <service_instance_name>
 ```
 
 ### Manual client connection

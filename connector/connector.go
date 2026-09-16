@@ -1,18 +1,24 @@
 package connector
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 	"text/template"
 
+	"code.cloudfoundry.org/cli/plugin"
+
+	"github.com/cloud-gov/cf-service-connect/api"
 	"github.com/cloud-gov/cf-service-connect/launcher"
 	"github.com/cloud-gov/cf-service-connect/models"
 	"github.com/cloud-gov/cf-service-connect/service"
-
-	"code.cloudfoundry.org/cli/plugin"
 )
 
-// Options are the structured representation of the command-line flags/arguments.
+// Options are the structured representation of the command-line
+// flags/arguments.
 type Options struct {
 	AppName             string
 	ServiceInstanceName string
@@ -37,7 +43,7 @@ type localConnectionData struct {
 	Name string
 }
 
-func manualConnect(tunnel launcher.SSHTunnel, creds models.Credentials) (err error) {
+func manualConnect(tunnel *launcher.SSHTunnel, creds models.Credentials) error {
 	connectionData := localConnectionData{
 		Port: tunnel.LocalPort,
 		User: creds.GetUsername(),
@@ -47,22 +53,36 @@ func manualConnect(tunnel launcher.SSHTunnel, creds models.Credentials) (err err
 
 	tmpl, err := template.New("").Parse(manualConnectInstructions)
 	if err != nil {
-		return
+		return err
 	}
-	err = tmpl.Execute(os.Stdout, connectionData)
-	if err != nil {
-		return
+	if err := tmpl.Execute(os.Stdout, connectionData); err != nil {
+		return err
 	}
 
-	// wait for a Control-C
-	tunnel.Wait()
+	// Wait for either a Control-C or the tunnel failing on its own. Previously
+	// only the tunnel was watched, so a tunnel that died left the user staring
+	// at instructions for a connection that no longer worked.
+	interrupted := make(chan os.Signal, 1)
+	signal.Notify(interrupted, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(interrupted)
 
-	return
+	tunnelClosed := make(chan error, 1)
+	go func() {
+		tunnelClosed <- tunnel.Wait()
+	}()
+
+	select {
+	case <-interrupted:
+		fmt.Println("\nClosing the SSH tunnel.")
+		return nil
+	case err := <-tunnelClosed:
+		return err
+	}
 }
 
 func handleClient(
 	options Options,
-	tunnel launcher.SSHTunnel,
+	tunnel *launcher.SSHTunnel,
 	si models.ServiceInstance,
 	creds models.Credentials,
 ) error {
@@ -79,39 +99,139 @@ func handleClient(
 	return manualConnect(tunnel, creds)
 }
 
-// Connect performs the primary action of the plugin: providing an SSH tunnel and launching the appropriate client, if desired.
-func Connect(cliConnection plugin.CliConnection, options Options) (err error) {
-	fmt.Println("Finding the service instance details...")
+// Connect performs the primary action of the plugin: providing an SSH tunnel
+// and launching the appropriate client, if desired.
+func Connect(cliConnection plugin.CliConnection, options Options) error {
+	return connect(context.Background(), api.NewConnection(cliConnection), options)
+}
 
-	serviceInstance, err := models.FetchServiceInstance(cliConnection, options.ServiceInstanceName)
+func connect(ctx context.Context, conn api.Connection, options Options) (err error) {
+	launcher.WarnIfCFBinaryNameSet()
+
+	client, err := api.NewClient(conn)
 	if err != nil {
-		return
+		return err
+	}
+
+	fmt.Println("Finding the service instance details...")
+	instance, err := client.GetServiceInstance(ctx, options.ServiceInstanceName)
+	if err != nil {
+		return err
+	}
+	serviceInstance := models.ServiceInstance{
+		GUID:    instance.GUID,
+		Name:    instance.Name,
+		Service: instance.Offering,
+		Plan:    instance.Plan,
+	}
+
+	app, err := client.GetApp(ctx, options.AppName)
+	if err != nil {
+		return err
+	}
+	if app.State != "STARTED" {
+		return fmt.Errorf("app %q is not started (state: %s); an SSH tunnel needs a running app instance", app.Name, app.State)
 	}
 
 	serviceKey := models.NewServiceKey(serviceInstance)
 
-	// clean up existing service key, if present
-	serviceKey.Delete(cliConnection)
-
-	err = serviceKey.Create(cliConnection)
-	if err != nil {
-		return
+	// Clean up a key left behind by an earlier interrupted run. Unlike before,
+	// a failure here is reported: it usually means the key exists but cannot be
+	// deleted, in which case the create below would fail with a less obvious
+	// "already exists" error.
+	if err := deleteExistingServiceKey(ctx, client, serviceKey); err != nil {
+		return err
 	}
-	defer serviceKey.Delete(cliConnection)
 
-	creds, err := serviceKey.GetCreds(cliConnection)
+	fmt.Println("Creating the service key...")
+	serviceKey.GUID, err = client.CreateServiceKey(ctx, serviceKey.Instance.GUID, serviceKey.Name)
 	if err != nil {
-		return
+		return err
+	}
+	defer func() {
+		fmt.Println("Deleting the service key...")
+		if deleteErr := client.DeleteServiceKey(ctx, serviceKey.GUID); deleteErr != nil {
+			// Report but do not mask the primary error: a leaked key is worth
+			// telling the user about, since they may need to remove it by hand
+			// before the next run.
+			fmt.Fprintf(os.Stderr,
+				"Warning: could not delete the temporary service key %q: %v\nRemove it with: cf delete-service-key %s %s\n",
+				serviceKey.Name, deleteErr, serviceKey.Instance.Name, serviceKey.Name)
+			if err == nil {
+				err = deleteErr
+			}
+		}
+	}()
+
+	rawCreds, err := client.GetServiceKeyCredentials(ctx, serviceKey.GUID)
+	if err != nil {
+		return err
+	}
+	creds, err := models.CredentialsFromMap(rawCreds)
+	if err != nil {
+		return err
 	}
 
 	fmt.Println("Setting up SSH tunnel...")
-	tunnel := launcher.NewSSHTunnel(creds, options.AppName)
-	err = tunnel.Open()
+	target, err := sshTarget(ctx, client, app)
 	if err != nil {
-		return
+		return err
 	}
-	defer tunnel.Close()
 
-	err = handleClient(options, tunnel, serviceInstance, creds)
-	return
+	tunnel := launcher.NewSSHTunnel(creds, target)
+	if err := tunnel.Open(); err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := tunnel.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
+
+	return handleClient(options, tunnel, serviceInstance, creds)
+}
+
+func deleteExistingServiceKey(ctx context.Context, client *api.Client, serviceKey models.ServiceKey) error {
+	guid, found, err := client.FindServiceKey(ctx, serviceKey.Instance.GUID, serviceKey.Name)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+
+	fmt.Printf("Removing the service key %q left over from a previous run...\n", serviceKey.Name)
+	if err := client.DeleteServiceKey(ctx, guid); err != nil {
+		return fmt.Errorf("could not remove the existing service key %q: %w", serviceKey.Name, err)
+	}
+	return nil
+}
+
+// sshTarget assembles everything needed to open an SSH session to the app: the
+// proxy endpoint from the CF API root document, a one-time passcode from UAA,
+// and the CF-format SSH username.
+func sshTarget(ctx context.Context, client *api.Client, app api.App) (launcher.SSHTarget, error) {
+	endpoint, err := client.GetSSHEndpoint(ctx)
+	if err != nil {
+		return launcher.SSHTarget{}, err
+	}
+
+	passcode, err := client.SSHPasscode(ctx)
+	if err != nil {
+		return launcher.SSHTarget{}, err
+	}
+	if passcode == "" {
+		return launcher.SSHTarget{}, errors.New("UAA returned an empty SSH passcode")
+	}
+
+	return launcher.SSHTarget{
+		Address:            endpoint.Address,
+		WebSocketURL:       endpoint.WebSocketURL,
+		HostKeyFingerprint: endpoint.HostKeyFingerprint,
+		// The SSH proxy authorises "cf:<app-guid>/<index>" and resolves the
+		// process itself; index 0 is the first web instance.
+		User:      fmt.Sprintf("cf:%s/0", app.GUID),
+		Passcode:  passcode,
+		TLSConfig: client.TLSConfig(),
+	}, nil
 }

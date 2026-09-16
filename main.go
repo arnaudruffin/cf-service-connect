@@ -5,9 +5,10 @@ import (
 	"flag"
 	"log"
 
-	"github.com/cloud-gov/cf-service-connect/connector"
-
 	"code.cloudfoundry.org/cli/plugin"
+
+	"github.com/cloud-gov/cf-service-connect/connector"
+	"github.com/cloud-gov/cf-service-connect/version"
 )
 
 const subcommand = "connect-to-service"
@@ -69,13 +70,23 @@ func (c *ServiceConnectPlugin) GetMetadata() plugin.PluginMetadata {
 	return plugin.PluginMetadata{
 		Name: "ServiceConnect",
 		Version: plugin.VersionType{
-			Major: 1,
-			Minor: 1,
-			Build: 4,
+			Major: version.Major,
+			Minor: version.Minor,
+			Build: version.Build,
 		},
+		// The plugin uses only CAPI v3 and creates its own SSH tunnel, so it
+		// needs very little from the CLI: ApiEndpoint, AccessToken,
+		// IsSSLDisabled and GetCurrentSpace, all of which are served from the
+		// local CLI config. Those have been available since v6.
+		//
+		// v8 is required all the same. CF CLI v6 and v7 resolve endpoints from
+		// /v2/info, so `cf login` and `cf target` -- which a user must run
+		// before this plugin can do anything -- do not work on a foundation with
+		// CAPI v2 disabled. Requiring v8 makes that a clear up-front message
+		// instead of a confusing failure inside the plugin.
 		MinCliVersion: plugin.VersionType{
-			Major: 6,
-			Minor: 15,
+			Major: 8,
+			Minor: 0,
 			Build: 0,
 		},
 		Commands: []plugin.Command{
