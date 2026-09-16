@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"code.cloudfoundry.org/cli/plugin"
+
 	"github.com/cloud-gov/cf-service-connect/api"
 	"github.com/cloud-gov/cf-service-connect/connector"
 	"github.com/stretchr/testify/assert"
@@ -67,14 +69,29 @@ func TestMetadataVersionMatchesTheAPIUserAgent(t *testing.T) {
 	assert.Contains(t, api.UserAgent(), "cf-service-connect/"+advertised)
 }
 
-// CF CLI v6 and v7 resolve endpoints from /v2/info, so they cannot even log in
-// to a foundation with CAPI v2 disabled. Requiring v8 turns that into a clear
-// message from the CLI rather than a confusing failure inside the plugin.
-func TestMetadataRequiresCFCLIV8(t *testing.T) {
+func TestMetadataVersionIsAtLeastV2(t *testing.T) {
 	metadata := (&ServiceConnectPlugin{}).GetMetadata()
 
 	assert.GreaterOrEqual(t, metadata.Version.Major, 2,
 		"the CAPI v3-only rewrite is a major version change")
-	assert.Equal(t, 8, metadata.MinCliVersion.Major,
-		"a v3-only plugin requires CF CLI v8")
+}
+
+// MinCliVersion must stay unset. Declaring any non-zero value makes the CLI
+// parse its own version as semver, which fails on the Homebrew cloudfoundry-cli
+// build -- its RFC3339 build date contains colons, which are illegal in semver
+// build metadata -- aborting every plugin command with "Invalid character(s)
+// found in build meta data". See upstream cloudfoundry/cli#3480 and the comment
+// in GetMetadata.
+//
+// The CF CLI v8 requirement is documented in the README instead.
+func TestMetadataDeclaresNoMinCliVersion(t *testing.T) {
+	metadata := (&ServiceConnectPlugin{}).GetMetadata()
+
+	assert.Equal(t, plugin.VersionType{}, metadata.MinCliVersion,
+		"declaring a MinCliVersion triggers a CF CLI semver bug on Homebrew builds; see cloudfoundry/cli#3480")
+
+	// Guard the mechanism, not just the value: the CLI only skips its check when
+	// MinCliVersionStr returns an empty string.
+	assert.Empty(t, plugin.MinCliVersionStr(metadata.MinCliVersion),
+		"a non-empty MinCliVersion string makes the CLI parse its own version")
 }

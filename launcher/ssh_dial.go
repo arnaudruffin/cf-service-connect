@@ -2,10 +2,12 @@ package launcher
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -62,7 +64,7 @@ func dialSSH(target SSHTarget) (*ssh.Client, error) {
 		}
 
 		if target.Address == "" {
-			return nil, fmt.Errorf("could not connect to the SSH proxy at %s: %w", target.WebSocketURL, err)
+			return nil, describeDialError(target.WebSocketURL, err)
 		}
 
 		// Both are advertised, so fall back rather than fail. Report the
@@ -78,7 +80,7 @@ func dialSSH(target SSHTarget) (*ssh.Client, error) {
 
 	client, err := dialSSHOverTCP(target, clientConfig)
 	if err != nil {
-		return nil, fmt.Errorf("could not connect to the SSH proxy at %s: %w", target.Address, err)
+		return nil, describeDialError(target.Address, err)
 	}
 	logger.Debugf("SSH connected over TCP to %s\n", target.Address)
 	return client, nil
@@ -86,6 +88,28 @@ func dialSSH(target SSHTarget) (*ssh.Client, error) {
 
 func dialSSHOverTCP(target SSHTarget, clientConfig *ssh.ClientConfig) (*ssh.Client, error) {
 	return ssh.Dial("tcp", target.Address, clientConfig)
+}
+
+// describeDialError wraps an SSH dial failure with the likely causes.
+//
+// x/crypto/ssh reports a rejected passcode as "unable to authenticate,
+// attempted methods [none password], no supported methods remain", which tells a
+// user nothing about why CF refused them. The SSH proxy authorises a session by
+// asking the Cloud Controller whether the user may access that app instance
+// (cloudfoundry/diego-ssh authenticators/cf_authenticator.go), so an
+// authentication failure usually means the authorization lookup failed rather
+// than that the passcode was malformed.
+func describeDialError(endpoint string, err error) error {
+	message := fmt.Sprintf("could not connect to the SSH proxy at %s: %v", endpoint, err)
+
+	if strings.Contains(err.Error(), "unable to authenticate") {
+		message += "\n\nThe SSH proxy rejected the one-time passcode. Common causes:" +
+			"\n  - SSH is disabled for the app or space: check `cf ssh-enabled APP` and `cf space-ssh-allowed SPACE`" +
+			"\n  - the targeted app instance is not running: check `cf app APP`" +
+			"\n  - your CF login lacks access to the app: check `cf target`"
+	}
+
+	return errors.New(message)
 }
 
 // dialSSHOverWebSocket tunnels the SSH protocol inside a WebSocket connection,

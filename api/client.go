@@ -181,9 +181,37 @@ type ServiceInstance struct {
 
 // App identifies an application to tunnel through.
 type App struct {
-	GUID  string
-	Name  string
+	GUID string
+	Name string
+
+	// State is the app's *desired* state ("STARTED"/"STOPPED"). It says nothing
+	// about whether any instance is actually running -- see GetSSHProcess.
 	State string
+}
+
+// SSHProcess identifies the specific app process and instance index that an SSH
+// session will target.
+type SSHProcess struct {
+	// GUID is the *process* GUID. The Diego SSH proxy expects a username of
+	// "cf:<process-guid>/<index>", not the app GUID. For a simple app whose only
+	// process is "web" the two GUIDs happen to be equal, which makes an app-GUID
+	// implementation appear to work; they are not equal in general.
+	GUID string
+
+	// Type is the process type, e.g. "web".
+	Type string
+
+	// Index is the zero-based instance index.
+	Index int
+}
+
+// SSHUsername renders the username the Diego SSH proxy authenticates.
+//
+// The proxy parses this with the regexp cf:<uuid>/<index> and resolves the
+// process via GET /internal/apps/:guid/ssh_access/:index (see
+// cloudfoundry/diego-ssh authenticators/cf_authenticator.go).
+func (p SSHProcess) SSHUsername() string {
+	return fmt.Sprintf("cf:%s/%d", p.GUID, p.Index)
 }
 
 // GetServiceInstance looks up a managed or user-provided service instance by
@@ -281,6 +309,123 @@ func (c *Client) GetApp(ctx context.Context, name string) (App, error) {
 		Name:  apps[0].Name,
 		State: apps[0].State,
 	}, nil
+}
+
+// CheckSSHEnabled verifies that SSH is permitted for the app.
+//
+// CAPI answers this precisely, reporting whether SSH is disabled globally, at
+// the space level, or for the app. Checking up front turns what would otherwise
+// be an opaque "ssh: unable to authenticate" failure deep in the SSH handshake
+// into an actionable message, and avoids provisioning a service key for a
+// connection that cannot succeed.
+func (c *Client) CheckSSHEnabled(ctx context.Context, app App) error {
+	cf, err := c.client()
+	if err != nil {
+		return err
+	}
+
+	sshEnabled, err := cf.Applications.SSHEnabled(ctx, app.GUID)
+	if err != nil {
+		return fmt.Errorf("could not determine whether SSH is enabled for app %q: %w", app.Name, err)
+	}
+	if sshEnabled == nil || sshEnabled.Enabled {
+		return nil
+	}
+
+	reason := sshEnabled.Reason
+	if reason == "" {
+		reason = "SSH is not enabled"
+	}
+	return fmt.Errorf(
+		"cannot open an SSH tunnel through app %q: %s.\nEnable it with `cf enable-ssh %s` (and `cf allow-space-ssh SPACE` if the space disallows SSH), then restart the app",
+		app.Name, reason, app.Name)
+}
+
+// defaultProcessType is the process an SSH session targets unless told
+// otherwise. It matches `cf ssh`'s default.
+const defaultProcessType = "web"
+
+// runningInstanceState is the CAPI instance state that can accept an SSH
+// session. The others -- CRASHED, STARTING, DOWN -- cannot.
+const runningInstanceState = "RUNNING"
+
+// GetSSHProcess resolves the process and instance an SSH session should target,
+// and verifies that instance is actually running.
+//
+// This check is not redundant with the app's STARTED state. STARTED is the
+// *desired* state: an app scaled to zero instances, or whose instances have
+// crashed or are still starting, reports STARTED while having no container to
+// connect to. Attempting SSH in that situation fails inside the SSH handshake,
+// because the Diego SSH proxy's authorization lookup for a nonexistent instance
+// fails, and the user sees only "ssh: unable to authenticate, attempted methods
+// [none password], no supported methods remain". Checking up front turns that
+// into an actionable message.
+//
+// This mirrors what `cf ssh` does in the CLI's
+// actor/v7action.GetSecureShellConfigurationByApplicationNameSpaceProcessTypeAndIndex:
+// resolve the process, then require the specific instance to be running.
+func (c *Client) GetSSHProcess(ctx context.Context, app App, processType string, index int) (SSHProcess, error) {
+	cf, err := c.client()
+	if err != nil {
+		return SSHProcess{}, err
+	}
+
+	if processType == "" {
+		processType = defaultProcessType
+	}
+
+	processes, err := cf.Processes.ListForAppAll(ctx, app.GUID, nil)
+	if err != nil {
+		return SSHProcess{}, fmt.Errorf("could not list the processes of app %q: %w", app.Name, err)
+	}
+
+	var process *resource.Process
+	for _, candidate := range processes {
+		if candidate.Type == processType {
+			process = candidate
+			break
+		}
+	}
+	if process == nil {
+		return SSHProcess{}, fmt.Errorf("app %q has no %q process", app.Name, processType)
+	}
+
+	result := SSHProcess{
+		GUID:  process.GUID,
+		Type:  process.Type,
+		Index: index,
+	}
+
+	stats, err := cf.Processes.GetStats(ctx, process.GUID)
+	if err != nil {
+		return SSHProcess{}, fmt.Errorf("could not read the instance status of app %q: %w", app.Name, err)
+	}
+
+	if stats == nil || len(stats.Stats) == 0 {
+		return SSHProcess{}, fmt.Errorf(
+			"app %q has no running instances of its %q process; an SSH tunnel needs a running app instance.\nStart one with: cf scale %s -i 1",
+			app.Name, processType, app.Name)
+	}
+
+	for _, instance := range stats.Stats {
+		if instance.Index != index {
+			continue
+		}
+		if instance.State != runningInstanceState {
+			detail := ""
+			if instance.Details != nil && *instance.Details != "" {
+				detail = fmt.Sprintf(" (%s)", *instance.Details)
+			}
+			return SSHProcess{}, fmt.Errorf(
+				"instance %d of the %q process of app %q is %s%s, not RUNNING; an SSH tunnel needs a running app instance.\nCheck it with: cf app %s",
+				index, processType, app.Name, instance.State, detail, app.Name)
+		}
+		return result, nil
+	}
+
+	return SSHProcess{}, fmt.Errorf(
+		"instance %d of the %q process of app %q does not exist (the process has %d instance(s)).\nCheck it with: cf app %s",
+		index, processType, app.Name, len(stats.Stats), app.Name)
 }
 
 // FindServiceKey returns the GUID of the service key with the given name on the

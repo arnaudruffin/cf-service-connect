@@ -30,6 +30,9 @@ const (
 	testOfferingGUID        = "a830ff8a-c956-484c-81ce-1f3625024981"
 	testKeyGUID             = "3d1e1f00-0000-4000-8000-000000000001"
 	testAppGUID             = "6f5deda9-4832-4dc8-bdaa-daa45f4f6b36"
+	// Deliberately different from testAppGUID: the SSH username must use the
+	// process GUID, and equal GUIDs would hide a regression.
+	testProcessGUID = "11112222-3333-4444-5555-666677778888"
 )
 
 // fakeFoundation serves the CAPI v3 and UAA routes that a full connect flow
@@ -41,6 +44,13 @@ type fakeFoundation struct {
 	requests []string
 
 	appState string
+
+	// instanceState is the CAPI state reported for web instance 0.
+	instanceState string
+
+	// sshEnabled and sshDisabledReason mirror GET /v3/apps/:guid/ssh_enabled.
+	sshEnabled        bool
+	sshDisabledReason string
 
 	// existingKeyGUID, when set, makes the credential-binding list report a
 	// leftover key from a previous run.
@@ -59,8 +69,10 @@ func newFakeFoundation(t *testing.T) *fakeFoundation {
 	t.Helper()
 
 	f := &fakeFoundation{
-		appState:     "STARTED",
-		deleteStatus: http.StatusNoContent,
+		appState:      "STARTED",
+		instanceState: "RUNNING",
+		sshEnabled:    true,
+		deleteStatus:  http.StatusNoContent,
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.route))
 	t.Cleanup(f.server.Close)
@@ -123,6 +135,15 @@ func (f *fakeFoundation) route(w http.ResponseWriter, r *http.Request) {
 			"pagination": {"total_results": 1, "total_pages": 1, "first": {"href": ""}, "last": {"href": ""}, "next": null, "previous": null},
 			"resources": [{"guid": %q, "name": "test-app", "state": %q}]
 		}`, testAppGUID, f.appState))
+	case r.URL.Path == "/v3/apps/"+testAppGUID+"/ssh_enabled":
+		writeRaw(w, http.StatusOK, fmt.Sprintf(`{"enabled": %t, "reason": %q}`, f.sshEnabled, f.sshDisabledReason))
+	case r.URL.Path == "/v3/apps/"+testAppGUID+"/processes":
+		writeRaw(w, http.StatusOK, fmt.Sprintf(`{
+			"pagination": {"total_results": 1, "total_pages": 1, "first": {"href": ""}, "last": {"href": ""}, "next": null, "previous": null},
+			"resources": [{"guid": %q, "type": "web", "instances": 1}]
+		}`, testProcessGUID))
+	case r.URL.Path == "/v3/processes/"+testProcessGUID+"/stats":
+		writeRaw(w, http.StatusOK, fmt.Sprintf(`{"resources": [{"type": "web", "index": 0, "state": %q, "details": null}]}`, f.instanceState))
 	case r.URL.Path == "/v3/service_credential_bindings" && r.Method == http.MethodGet:
 		f.writeBindingList(w)
 	case r.URL.Path == "/v3/service_credential_bindings" && r.Method == http.MethodPost:
@@ -245,6 +266,8 @@ func TestConnectPerformsTheFullV3FlowAndCleansUp(t *testing.T) {
 
 	assert.Contains(t, joined, "GET /v3/service_instances")
 	assert.Contains(t, joined, "GET /v3/apps")
+	assert.Contains(t, joined, "GET /v3/apps/"+testAppGUID+"/processes")
+	assert.Contains(t, joined, "GET /v3/processes/"+testProcessGUID+"/stats")
 	assert.Contains(t, joined, "POST /v3/service_credential_bindings")
 	assert.Contains(t, joined, "/details")
 
@@ -302,6 +325,9 @@ func TestConnectReportsAFailedLeftoverKeyDeletion(t *testing.T) {
 	assert.Contains(t, err.Error(), "could not remove the existing service key")
 }
 
+// SSH prerequisites are resolved before a service key is created, so a
+// foundation without an SSH endpoint fails without provisioning credentials it
+// would immediately throw away.
 func TestConnectFailsWhenNoSSHEndpointIsAdvertised(t *testing.T) {
 	f := newFakeFoundation(t)
 	f.omitAppSSH = true
@@ -314,8 +340,27 @@ func TestConnectFailsWhenNoSSHEndpointIsAdvertised(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "advertises no SSH endpoint")
 
-	// The key must still be cleaned up.
-	assert.Positive(t, f.deleteCount())
+	assert.NotContains(t, strings.Join(f.requestedPaths(), "\n"), "POST /v3/service_credential_bindings",
+		"SSH prerequisites must be checked before a service key is created")
+}
+
+// An app scaled to zero instances reports STARTED but has no container to tunnel
+// through. This is the failure users hit as an opaque SSH "unable to
+// authenticate" error before the instance check existed.
+func TestConnectRejectsAnAppWithNoRunningInstance(t *testing.T) {
+	f := newFakeFoundation(t)
+	f.instanceState = "CRASHED"
+
+	err := connect(context.Background(), newStubConnection(f), Options{
+		AppName:             "test-app",
+		ServiceInstanceName: "my-test-service",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not RUNNING")
+
+	assert.NotContains(t, strings.Join(f.requestedPaths(), "\n"), "POST /v3/service_credential_bindings",
+		"a service key must not be created for an app that cannot be reached")
 }
 
 func TestConnectFailsWhenTheServiceInstanceIsMissing(t *testing.T) {
@@ -336,4 +381,44 @@ func TestConnectFailsWhenTheServiceInstanceIsMissing(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not found in the targeted space")
+}
+
+// End-to-end guard on the SSH username: the tunnel must be told
+// "cf:<process-guid>/0", not "cf:<app-guid>/0". The fake foundation reports a
+// process GUID that differs from the app GUID, so an app-GUID regression fails
+// here rather than silently working on simple single-process apps.
+func TestConnectTargetsTheProcessGUIDForSSH(t *testing.T) {
+	f := newFakeFoundation(t)
+
+	client, err := api.NewClient(newStubConnection(f))
+	require.NoError(t, err)
+
+	app, err := client.GetApp(context.Background(), "test-app")
+	require.NoError(t, err)
+
+	target, err := sshTarget(context.Background(), client, app)
+	require.NoError(t, err)
+
+	assert.Equal(t, "cf:"+testProcessGUID+"/0", target.User)
+	assert.NotEqual(t, "cf:"+testAppGUID+"/0", target.User)
+}
+
+// SSH being disabled for the app is knowable before any credentials are
+// provisioned, so it must fail without creating a service key.
+func TestConnectRejectsAnAppWithSSHDisabled(t *testing.T) {
+	f := newFakeFoundation(t)
+	f.sshEnabled = false
+	f.sshDisabledReason = "ssh is disabled for app"
+
+	err := connect(context.Background(), newStubConnection(f), Options{
+		AppName:             "test-app",
+		ServiceInstanceName: "my-test-service",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ssh is disabled for app")
+	assert.Contains(t, err.Error(), "cf enable-ssh test-app")
+
+	assert.NotContains(t, strings.Join(f.requestedPaths(), "\n"), "POST /v3/service_credential_bindings",
+		"a service key must not be created when SSH is disabled")
 }

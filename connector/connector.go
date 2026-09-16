@@ -25,6 +25,18 @@ type Options struct {
 	ConnectClient       bool
 }
 
+// startedAppState is the CF app state that indicates the operator wants the app
+// running. It is a desired state, not a guarantee that an instance exists.
+const startedAppState = "STARTED"
+
+// The plugin tunnels through the app's first web instance, matching `cf ssh`'s
+// default. These are named constants rather than literals so the intent is
+// visible at the call site.
+const (
+	sshProcessType   = "web"
+	sshInstanceIndex = 0
+)
+
 const manualConnectInstructions = `Skipping call to client CLI. Connection information:
 
 Host: localhost
@@ -129,8 +141,18 @@ func connect(ctx context.Context, conn api.Connection, options Options) (err err
 	if err != nil {
 		return err
 	}
-	if app.State != "STARTED" {
-		return fmt.Errorf("app %q is not started (state: %s); an SSH tunnel needs a running app instance", app.Name, app.State)
+	if app.State != startedAppState {
+		return fmt.Errorf("app %q is not started (state: %s); an SSH tunnel needs a running app instance.\nStart it with: cf start %s",
+			app.Name, app.State, app.Name)
+	}
+
+	// Resolve everything the SSH session needs *before* creating a service key.
+	// All of these can fail for reasons the user must fix (SSH disabled, no
+	// running instance, no SSH endpoint), and there is no point provisioning
+	// credentials we are then going to throw away.
+	target, err := sshTarget(ctx, client, app)
+	if err != nil {
+		return err
 	}
 
 	serviceKey := models.NewServiceKey(serviceInstance)
@@ -173,11 +195,6 @@ func connect(ctx context.Context, conn api.Connection, options Options) (err err
 	}
 
 	fmt.Println("Setting up SSH tunnel...")
-	target, err := sshTarget(ctx, client, app)
-	if err != nil {
-		return err
-	}
-
 	tunnel := launcher.NewSSHTunnel(creds, target)
 	if err := tunnel.Open(); err != nil {
 		return err
@@ -208,10 +225,21 @@ func deleteExistingServiceKey(ctx context.Context, client *api.Client, serviceKe
 }
 
 // sshTarget assembles everything needed to open an SSH session to the app: the
-// proxy endpoint from the CF API root document, a one-time passcode from UAA,
-// and the CF-format SSH username.
+// proxy endpoint from the CF API root document, the process instance to target,
+// and a one-time passcode from UAA.
 func sshTarget(ctx context.Context, client *api.Client, app api.App) (launcher.SSHTarget, error) {
 	endpoint, err := client.GetSSHEndpoint(ctx)
+	if err != nil {
+		return launcher.SSHTarget{}, err
+	}
+
+	if err := client.CheckSSHEnabled(ctx, app); err != nil {
+		return launcher.SSHTarget{}, err
+	}
+
+	// The app being STARTED does not mean an instance is running, and the SSH
+	// username needs the process GUID rather than the app GUID.
+	process, err := client.GetSSHProcess(ctx, app, sshProcessType, sshInstanceIndex)
 	if err != nil {
 		return launcher.SSHTarget{}, err
 	}
@@ -228,10 +256,8 @@ func sshTarget(ctx context.Context, client *api.Client, app api.App) (launcher.S
 		Address:            endpoint.Address,
 		WebSocketURL:       endpoint.WebSocketURL,
 		HostKeyFingerprint: endpoint.HostKeyFingerprint,
-		// The SSH proxy authorises "cf:<app-guid>/<index>" and resolves the
-		// process itself; index 0 is the first web instance.
-		User:      fmt.Sprintf("cf:%s/0", app.GUID),
-		Passcode:  passcode,
-		TLSConfig: client.TLSConfig(),
+		User:               process.SSHUsername(),
+		Passcode:           passcode,
+		TLSConfig:          client.TLSConfig(),
 	}, nil
 }

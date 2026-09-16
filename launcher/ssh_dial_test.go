@@ -345,3 +345,41 @@ func TestWebSocketDialUsesBinaryFrames(t *testing.T) {
 		t.Fatal("the WebSocket server received no data frame from the client")
 	}
 }
+
+// x/crypto/ssh reports a rejected passcode as "unable to authenticate, attempted
+// methods [none password], no supported methods remain", which tells a CF user
+// nothing. The wrapped error must name the realistic causes.
+func TestDialSSHExplainsAnAuthenticationFailure(t *testing.T) {
+	server := newTestSSHServer(t)
+	address := server.listenTCP(t)
+
+	_, err := dialSSH(SSHTarget{
+		Address:            address,
+		HostKeyFingerprint: server.fingerprint,
+		User:               testSSHUser,
+		Passcode:           "wrong",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rejected the one-time passcode")
+	assert.Contains(t, err.Error(), "cf ssh-enabled")
+	assert.Contains(t, err.Error(), "cf app APP")
+}
+
+// A non-authentication failure must not gain the misleading passcode advice.
+func TestDialSSHDoesNotExplainNonAuthFailures(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	deadAddress := listener.Addr().String()
+	require.NoError(t, listener.Close())
+
+	_, err = dialSSH(SSHTarget{
+		Address:            deadAddress,
+		HostKeyFingerprint: "irrelevant",
+		User:               testSSHUser,
+		Passcode:           testSSHPasscode,
+	})
+
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "rejected the one-time passcode")
+}

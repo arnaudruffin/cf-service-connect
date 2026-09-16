@@ -18,6 +18,21 @@ Currently supports (most) service brokers for the following:
 ## Local installation
 
 1. Install the [Cloud Foundry CLI](https://docs.cloudfoundry.org/cf-cli/install-go-cli.html) v8.0.0 or later. See [CF CLI and CAPI compatibility](#cf-cli-and-capi-compatibility) for why v8 is required.
+
+    > **Warning**
+    > On macOS, install the CLI from the official tap, **not** the
+    > `cloudfoundry-cli` Homebrew formula:
+    >
+    > ```sh
+    > brew install cloudfoundry/tap/cf-cli@8
+    > ```
+    >
+    > The `cloudfoundry-cli` formula stamps a build date containing colons into
+    > the CLI's version string, which is not valid semver. Any plugin command
+    > then fails with `Invalid character(s) found in build meta data`. This is
+    > [cloudfoundry/cli#3480](https://github.com/cloudfoundry/cli/issues/3480)
+    > and affects all plugins, not just this one. Check with `cf --version`: if
+    > the build metadata after the `+` contains a `:`, switch to the tap.
 2. Install this plugin, using the appropriate binary URL from [the Releases page](https://github.com/18F/cf-service-connect/releases).
 
     ```sh
@@ -38,11 +53,18 @@ cf-deployment since v47.0.0 — see [RFC-0032: CF API v2 EOL](https://github.com
 
 Two consequences are worth knowing about:
 
-**CF CLI v8 is required.** The plugin itself needs very little from the CLI, but
-CF CLI v6 and v7 resolve their endpoints from `/v2/info`, so `cf login` and
-`cf target` do not work at all against a v2-disabled foundation. Requiring v8
-turns that into a clear message from the CLI rather than a confusing failure
-inside the plugin.
+**CF CLI v8 is required.** The plugin itself needs very little from the CLI — only
+`ApiEndpoint`, `AccessToken`, `IsSSLDisabled` and `GetCurrentSpace`, all
+available since v6 — but CF CLI v6 and v7 resolve their endpoints from
+`/v2/info`, so `cf login` and `cf target` do not work at all against a
+v2-disabled foundation.
+
+The plugin does **not** declare a `MinCliVersion` to enforce this, deliberately:
+declaring one makes the CLI parse its own version as semver, which fails on
+Homebrew `cloudfoundry-cli` builds (see the warning under
+[Local installation](#local-installation)). Since a user who cannot `cf login`
+never reaches the plugin anyway, the requirement is documented here instead of
+gated in code.
 
 **The plugin creates its own SSH tunnel.** Earlier versions shelled out to
 `cf ssh`. They cannot work on a v2-disabled foundation, because a plugin cannot
@@ -78,7 +100,32 @@ Connecting client...
 psql>
 ```
 
-If you get an error such as "connection refused", "error opening SSH connection", or "psql: could not connect to server: Connection refused" this is usually caused by being on a network that blocks the SSH port that this tool is trying to use. Try using a different network, or consider asking your network administrator to unblock the port (typically 22 and/or 2222). On foundations that advertise the `app_ssh_ws` endpoint the plugin tunnels SSH over `wss://` on port 443 instead, which avoids this class of problem.
+### Troubleshooting
+
+**`Invalid character(s) found in build meta data`** — your `cf` binary reports a
+version that is not valid semver. Install the CLI from
+`cloudfoundry/tap/cf-cli@8` rather than the `cloudfoundry-cli` Homebrew formula;
+see the warning under [Local installation](#local-installation).
+
+**`This cf CLI plugin is not intended to be run on its own`, or
+`dial tcp: lookup tcp/APP: unknown port`** — you ran the plugin binary directly.
+Plugins are not standalone executables; the CLI passes them an RPC port as their
+first argument. Install it and invoke it through `cf`:
+
+```sh
+go build -o cf-service-connect
+cf install-plugin -f ./cf-service-connect
+cf connect-to-service <app_name> <service_instance_name>
+```
+
+**`The SSH proxy rejected the one-time passcode`** — the SSH proxy asks the Cloud
+Controller whether you may access that app instance, so this usually means the
+authorization check failed rather than that the passcode was wrong. Check
+`cf ssh-enabled APP`, `cf space-ssh-allowed SPACE`, that the app has a running
+instance (`cf app APP`), and that you are targeting the right org and space.
+
+**`connection refused`, `error opening SSH connection`, or
+`psql: could not connect to server: Connection refused`** — this is usually caused by being on a network that blocks the SSH port that this tool is trying to use. Try using a different network, or consider asking your network administrator to unblock the port (typically 22 and/or 2222). On foundations that advertise the `app_ssh_ws` endpoint the plugin tunnels SSH over `wss://` on port 443 instead, which avoids this class of problem.
 
 ### Optional: overriding `cf` CLI binary name
 

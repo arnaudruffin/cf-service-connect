@@ -674,3 +674,187 @@ func TestAccessTokenExpiry(t *testing.T) {
 func TestUserAgentIdentifiesThePlugin(t *testing.T) {
 	assert.Contains(t, UserAgent(), "cf-service-connect/")
 }
+
+func processListJSON(processGUID, processType string, instances int) string {
+	return fmt.Sprintf(`{
+		"pagination": {"total_results": 1, "total_pages": 1, "first": {"href": ""}, "last": {"href": ""}, "next": null, "previous": null},
+		"resources": [{"guid": %q, "type": %q, "instances": %d}]
+	}`, processGUID, processType, instances)
+}
+
+func processStatsJSON(states ...string) string {
+	entries := make([]string, 0, len(states))
+	for i, state := range states {
+		entries = append(entries, fmt.Sprintf(`{"type": "web", "index": %d, "state": %q, "details": null}`, i, state))
+	}
+	return fmt.Sprintf(`{"resources": [%s]}`, strings.Join(entries, ","))
+}
+
+func stubProcesses(f *fakeCF, processGUID string, statsJSON string) {
+	f.handle("GET /v3/apps/"+testAppGUID+"/processes", func(w http.ResponseWriter, _ *http.Request) {
+		writeRaw(w, http.StatusOK, processListJSON(processGUID, "web", 1))
+	})
+	f.handle("GET /v3/processes/"+processGUID+"/stats", func(w http.ResponseWriter, _ *http.Request) {
+		writeRaw(w, http.StatusOK, statsJSON)
+	})
+}
+
+func startedTestApp() App {
+	return App{GUID: testAppGUID, Name: "test-app", State: "STARTED"}
+}
+
+// The Diego SSH proxy authenticates "cf:<process-guid>/<index>". For a simple
+// app whose only process is "web", the process GUID equals the app GUID -- which
+// is why using the app GUID appears to work. This asserts the process GUID is
+// used, with a process GUID deliberately different from the app GUID.
+func TestGetSSHProcessUsesTheProcessGUIDNotTheAppGUID(t *testing.T) {
+	f := newFakeCF(t)
+	const distinctProcessGUID = "11112222-3333-4444-5555-666677778888"
+	stubProcesses(f, distinctProcessGUID, processStatsJSON("RUNNING"))
+
+	client, _ := newTestClient(t, f)
+
+	process, err := client.GetSSHProcess(context.Background(), startedTestApp(), "web", 0)
+
+	require.NoError(t, err)
+	assert.Equal(t, distinctProcessGUID, process.GUID)
+	assert.NotEqual(t, testAppGUID, process.GUID)
+	assert.Equal(t, "cf:"+distinctProcessGUID+"/0", process.SSHUsername())
+}
+
+// An app scaled to zero instances still reports STARTED. Without this check the
+// SSH handshake fails with an opaque "unable to authenticate" error.
+func TestGetSSHProcessRejectsAnAppWithNoInstances(t *testing.T) {
+	f := newFakeCF(t)
+	stubProcesses(f, testAppGUID, `{"resources": []}`)
+
+	client, _ := newTestClient(t, f)
+
+	_, err := client.GetSSHProcess(context.Background(), startedTestApp(), "web", 0)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no running instances")
+	assert.Contains(t, err.Error(), "cf scale test-app -i 1")
+}
+
+func TestGetSSHProcessRejectsANonRunningInstance(t *testing.T) {
+	for _, state := range []string{"CRASHED", "STARTING", "DOWN"} {
+		t.Run(state, func(t *testing.T) {
+			f := newFakeCF(t)
+			stubProcesses(f, testAppGUID, processStatsJSON(state))
+
+			client, _ := newTestClient(t, f)
+
+			_, err := client.GetSSHProcess(context.Background(), startedTestApp(), "web", 0)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), state)
+			assert.Contains(t, err.Error(), "not RUNNING")
+		})
+	}
+}
+
+// CAPI reports placement problems in the instance "details" field; surfacing it
+// saves the user a trip to `cf app`.
+func TestGetSSHProcessIncludesInstanceDetails(t *testing.T) {
+	f := newFakeCF(t)
+	stubProcesses(f, testAppGUID,
+		`{"resources": [{"type": "web", "index": 0, "state": "CRASHED", "details": "insufficient resources: memory"}]}`)
+
+	client, _ := newTestClient(t, f)
+
+	_, err := client.GetSSHProcess(context.Background(), startedTestApp(), "web", 0)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "insufficient resources: memory")
+}
+
+func TestGetSSHProcessRejectsAMissingInstanceIndex(t *testing.T) {
+	f := newFakeCF(t)
+	stubProcesses(f, testAppGUID, processStatsJSON("RUNNING"))
+
+	client, _ := newTestClient(t, f)
+
+	// Only index 0 exists.
+	_, err := client.GetSSHProcess(context.Background(), startedTestApp(), "web", 3)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not exist")
+}
+
+func TestGetSSHProcessRejectsAMissingProcessType(t *testing.T) {
+	f := newFakeCF(t)
+	stubProcesses(f, testAppGUID, processStatsJSON("RUNNING"))
+
+	client, _ := newTestClient(t, f)
+
+	_, err := client.GetSSHProcess(context.Background(), startedTestApp(), "worker", 0)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `has no "worker" process`)
+}
+
+func TestGetSSHProcessDefaultsToTheWebProcess(t *testing.T) {
+	f := newFakeCF(t)
+	stubProcesses(f, testAppGUID, processStatsJSON("RUNNING"))
+
+	client, _ := newTestClient(t, f)
+
+	process, err := client.GetSSHProcess(context.Background(), startedTestApp(), "", 0)
+
+	require.NoError(t, err)
+	assert.Equal(t, "web", process.Type)
+}
+
+// A multi-instance app must be able to target index 0 even when later instances
+// are unhealthy.
+func TestGetSSHProcessAcceptsIndexZeroWhenOtherInstancesAreUnhealthy(t *testing.T) {
+	f := newFakeCF(t)
+	stubProcesses(f, testAppGUID, processStatsJSON("RUNNING", "CRASHED"))
+
+	client, _ := newTestClient(t, f)
+
+	process, err := client.GetSSHProcess(context.Background(), startedTestApp(), "web", 0)
+
+	require.NoError(t, err)
+	assert.Equal(t, 0, process.Index)
+}
+
+func stubSSHEnabled(f *fakeCF, enabled bool, reason string) {
+	f.handle("GET /v3/apps/"+testAppGUID+"/ssh_enabled", func(w http.ResponseWriter, _ *http.Request) {
+		writeRaw(w, http.StatusOK, fmt.Sprintf(`{"enabled": %t, "reason": %q}`, enabled, reason))
+	})
+}
+
+func TestCheckSSHEnabledAllowsAnSSHEnabledApp(t *testing.T) {
+	f := newFakeCF(t)
+	stubSSHEnabled(f, true, "")
+
+	client, _ := newTestClient(t, f)
+
+	assert.NoError(t, client.CheckSSHEnabled(context.Background(), startedTestApp()))
+}
+
+// CAPI reports whether SSH is disabled globally, at the space level, or for the
+// app. Surfacing that reason is the difference between an actionable message and
+// an opaque SSH handshake failure.
+func TestCheckSSHEnabledRejectsAndExplains(t *testing.T) {
+	for _, reason := range []string{
+		"ssh is disabled for app",
+		"ssh is disabled for space",
+		"ssh is disabled globally",
+	} {
+		t.Run(reason, func(t *testing.T) {
+			f := newFakeCF(t)
+			stubSSHEnabled(f, false, reason)
+
+			client, _ := newTestClient(t, f)
+
+			err := client.CheckSSHEnabled(context.Background(), startedTestApp())
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), reason)
+			assert.Contains(t, err.Error(), "cf enable-ssh test-app")
+		})
+	}
+}
