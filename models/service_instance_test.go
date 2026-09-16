@@ -3,58 +3,23 @@ package models
 import (
 	"testing"
 
-	"code.cloudfoundry.org/cli/plugin/models"
-	"code.cloudfoundry.org/cli/plugin/pluginfakes"
 	"github.com/stretchr/testify/assert"
 )
 
-type containsTermTest struct {
-	service  string
-	plan     string
-	term     string
-	contains bool
-}
-
-type fetchServiceInstanceTest struct {
-	serviceModel            plugin_models.GetService_Model
-	getServiceError         error
-	serviceName             string
-	expectedServiceInstance ServiceInstance
-	expectedError           error
-}
-
 func TestContainsTerms(t *testing.T) {
-	tests := []containsTermTest{
-		{
-			service:  "foo",
-			plan:     "bar",
-			term:     "foo",
-			contains: true,
-		},
-		{
-			service:  "foo",
-			plan:     "bar",
-			term:     "bar",
-			contains: true,
-		},
-		{
-			service:  "Foo",
-			plan:     "bar",
-			term:     "foo",
-			contains: true,
-		},
-		{
-			service:  "foo",
-			plan:     "Bar",
-			term:     "bar",
-			contains: true,
-		},
-		{
-			service:  "foo",
-			plan:     "bar",
-			term:     "baz",
-			contains: false,
-		},
+	tests := []struct {
+		service  string
+		plan     string
+		term     string
+		contains bool
+	}{
+		{service: "foo", plan: "bar", term: "foo", contains: true},
+		{service: "foo", plan: "bar", term: "bar", contains: true},
+		{service: "Foo", plan: "bar", term: "foo", contains: true},
+		{service: "foo", plan: "Bar", term: "bar", contains: true},
+		{service: "foo", plan: "bar", term: "baz", contains: false},
+		// A user-provided service instance has neither offering nor plan.
+		{service: "", plan: "", term: "psql", contains: false},
 	}
 
 	for _, test := range tests {
@@ -62,38 +27,24 @@ func TestContainsTerms(t *testing.T) {
 			Service: test.service,
 			Plan:    test.plan,
 		}
-		assert.Equal(t, si.ContainsTerms(test.term), test.contains)
+		assert.Equal(t, test.contains, si.ContainsTerms(test.term))
 	}
 }
 
-func TestFetchServiceInstance(t *testing.T) {
-	tests := []fetchServiceInstanceTest{
-		{
-			serviceModel: plugin_models.GetService_Model{
-				Guid: "test-guid",
-				Name: "something-else",
-				ServicePlan: plugin_models.GetService_ServicePlan{
-					Name: "shared-plan",
-				},
-				ServiceOffering: plugin_models.GetService_ServiceFields{
-					Name: "aws-rds",
-				},
-			},
-			getServiceError: nil,
-			serviceName:     "my-test-db",
-			expectedServiceInstance: ServiceInstance{
-				GUID:    "test-guid",
-				Service: "aws-rds",
-				Name:    "my-test-db",
-				Plan:    "shared-plan",
-			},
-		},
-	}
-	for _, test := range tests {
-		fakeCliConnection := &pluginfakes.FakeCliConnection{}
-		fakeCliConnection.GetServiceReturns(test.serviceModel, test.getServiceError)
-		serviceInstance, err := FetchServiceInstance(fakeCliConnection, test.serviceName)
-		assert.Equal(t, serviceInstance, test.expectedServiceInstance)
-		assert.Equal(t, err, test.expectedError)
-	}
+func TestContainsTermsMatchesAnyTerm(t *testing.T) {
+	si := ServiceInstance{Service: "aws-rds", Plan: "micro-psql"}
+
+	assert.True(t, si.ContainsTerms("psql", "postgres"))
+	assert.True(t, si.ContainsTerms("mysql", "rds"))
+	assert.False(t, si.ContainsTerms("mongo", "redis"))
+}
+
+func TestNewServiceKey(t *testing.T) {
+	instance := ServiceInstance{GUID: "instance-guid", Name: "my-db"}
+
+	key := NewServiceKey(instance)
+
+	assert.Equal(t, instance, key.Instance)
+	assert.Equal(t, "SERVICE_CONNECT", key.Name)
+	assert.Empty(t, key.GUID, "the GUID is only known once the key has been created or found")
 }

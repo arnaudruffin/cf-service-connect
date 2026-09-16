@@ -5,9 +5,10 @@ import (
 	"flag"
 	"log"
 
-	"github.com/cloud-gov/cf-service-connect/connector"
-
 	"code.cloudfoundry.org/cli/plugin"
+
+	"github.com/cloud-gov/cf-service-connect/connector"
+	"github.com/cloud-gov/cf-service-connect/version"
 )
 
 const subcommand = "connect-to-service"
@@ -69,13 +70,36 @@ func (c *ServiceConnectPlugin) GetMetadata() plugin.PluginMetadata {
 	return plugin.PluginMetadata{
 		Name: "ServiceConnect",
 		Version: plugin.VersionType{
-			Major: 1,
-			Minor: 1,
-			Build: 4,
+			Major: version.Major,
+			Minor: version.Minor,
+			Build: version.Build,
 		},
+		// MinCliVersion is deliberately left unset (0.0.0), which makes the CLI
+		// skip its version check entirely.
+		//
+		// CF CLI v8 *is* required in practice, and the README says so: v6 and v7
+		// resolve endpoints from /v2/info, so `cf login` and `cf target` do not
+		// work at all against a foundation with CAPI v2 disabled. But declaring
+		// it here does more harm than good.
+		//
+		// Declaring any non-zero MinCliVersion makes the CLI parse *its own*
+		// version as semver (plugin/rpc/cli_rpc_server.go IsMinCliVersion). The
+		// Homebrew `cloudfoundry-cli` formula stamps an RFC3339 build date into
+		// that version, and the colons are illegal in semver build metadata, so
+		// the parse fails and every plugin command aborts with:
+		//
+		//	Invalid character(s) found in build meta data "2026-08-28T19:04:31Z"
+		//
+		// That is upstream cloudfoundry/cli#3480, closed as "use
+		// cloudfoundry/tap/cf-cli@8 instead of the cloudfoundry-cli formula".
+		// Since the plugin only uses CLI methods available since v6, and a user
+		// who cannot `cf login` never reaches the plugin at all, the version gate
+		// blocks nothing we actually need while breaking a common install path.
+		//
+		// Do not set this without first confirming the upstream bug is fixed.
 		MinCliVersion: plugin.VersionType{
-			Major: 6,
-			Minor: 15,
+			Major: 0,
+			Minor: 0,
 			Build: 0,
 		},
 		Commands: []plugin.Command{

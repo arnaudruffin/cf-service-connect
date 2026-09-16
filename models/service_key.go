@@ -1,48 +1,26 @@
 package models
 
-import (
-	"fmt"
-	"net/url"
-	"strings"
-
-	"code.cloudfoundry.org/cli/plugin"
-)
-
+// ServiceKey identifies the temporary service key that the plugin creates in
+// order to obtain connection credentials.
+//
+// In CAPI v3 a service key is a service credential binding of type "key".
 type ServiceKey struct {
 	Instance ServiceInstance
-	ID       string
+
+	// Name is the service key's name in CF.
+	Name string
+
+	// GUID is populated once the key has been created or found.
+	GUID string
 }
 
-func (sk *ServiceKey) Create(conn plugin.CliConnection) error {
-	_, err := conn.CliCommandWithoutTerminalOutput("create-service-key", sk.Instance.Name, sk.ID)
-	return err
-}
+// serviceKeyName is the name used for the plugin's temporary service key.
+const serviceKeyName = "SERVICE_CONNECT"
 
-func (sk *ServiceKey) Delete(conn plugin.CliConnection) error {
-	_, err := conn.CliCommandWithoutTerminalOutput("delete-service-key", "-f", sk.Instance.Name, sk.ID)
-	return err
-}
-
-func (sk *ServiceKey) GetCreds(cliConnection plugin.CliConnection) (creds Credentials, err error) {
-	serviceKeyAPI := fmt.Sprintf("/v2/service_instances/%s/service_keys?q=name%%3A%s", sk.Instance.GUID, url.QueryEscape(sk.ID))
-	bodyLines, err := cliConnection.CliCommandWithoutTerminalOutput("curl", serviceKeyAPI)
-	if err != nil {
-		return
-	}
-
-	body := strings.Join(bodyLines, "")
-	creds, err = CredentialsFromJSON(body)
-	return
-}
-
-func generateServiceKeyID() string {
-	// TODO find one that's available, or randomize
-	return "SERVICE_CONNECT"
-}
-
+// NewServiceKey describes the service key for a given instance.
 func NewServiceKey(instance ServiceInstance) ServiceKey {
 	return ServiceKey{
 		Instance: instance,
-		ID:       generateServiceKeyID(),
+		Name:     serviceKeyName,
 	}
 }

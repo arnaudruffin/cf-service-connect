@@ -2,10 +2,10 @@ package models
 
 import (
 	"strings"
-
-	"code.cloudfoundry.org/cli/plugin"
 )
 
+// ServiceInstance identifies a service instance and the offering/plan used to
+// pick a matching database client.
 type ServiceInstance struct {
 	GUID    string
 	Name    string
@@ -13,6 +13,8 @@ type ServiceInstance struct {
 	Plan    string
 }
 
+// ContainsTerms reports whether any of the given terms appears in the service
+// offering or plan name, case-insensitively.
 func (si *ServiceInstance) ContainsTerms(items ...string) bool {
 	for _, item := range items {
 		item = strings.ToLower(item)
@@ -23,19 +25,4 @@ func (si *ServiceInstance) ContainsTerms(items ...string) bool {
 		}
 	}
 	return false
-}
-
-func FetchServiceInstance(cliConnection plugin.CliConnection, name string) (si ServiceInstance, err error) {
-	srv, err := cliConnection.GetService(name)
-	if err != nil {
-		return
-	}
-
-	si = ServiceInstance{
-		GUID:    srv.Guid,
-		Service: srv.ServiceOffering.Name,
-		Plan:    srv.ServicePlan.Name,
-		Name:    name,
-	}
-	return
 }
