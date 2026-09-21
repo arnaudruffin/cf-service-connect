@@ -62,7 +62,10 @@ type fakeFoundation struct {
 	// omitAppSSH removes the app_ssh link from the root document.
 	omitAppSSH bool
 
-	deletes int
+	deletes             int
+	credentialResponses []string
+	credentialRequests  int
+	blockedCredentials  int
 }
 
 func newFakeFoundation(t *testing.T) *fakeFoundation {
@@ -149,9 +152,7 @@ func (f *fakeFoundation) route(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/v3/service_credential_bindings" && r.Method == http.MethodPost:
 		writeRaw(w, http.StatusCreated, fmt.Sprintf(`{"guid": %q, "name": "SERVICE_CONNECT", "type": "key"}`, testKeyGUID))
 	case strings.HasSuffix(r.URL.Path, "/details"):
-		writeRaw(w, http.StatusOK, `{"credentials": {
-			"host": "db.example.com", "port": 5432,
-			"db_name": "testdb", "username": "testuser", "password": "testpass"}}`)
+		f.writeCredentials(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v3/service_credential_bindings/") && r.Method == http.MethodDelete:
 		f.mu.Lock()
 		f.deletes++
@@ -164,6 +165,26 @@ func (f *fakeFoundation) route(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeRaw(w, http.StatusNotFound, `{"errors":[{"detail":"Unknown request","title":"CF-NotFound","code":10000}]}`)
 	}
+}
+
+func (f *fakeFoundation) writeCredentials(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	requestIndex := f.credentialRequests
+	f.credentialRequests++
+	block := requestIndex < f.blockedCredentials
+	response := `{"credentials": {
+		"host": "db.example.com", "port": 5432,
+		"db_name": "testdb", "username": "testuser", "password": "testpass"}}`
+	if requestIndex < len(f.credentialResponses) {
+		response = f.credentialResponses[requestIndex]
+	}
+	f.mu.Unlock()
+
+	if block {
+		<-r.Context().Done()
+		return
+	}
+	writeRaw(w, http.StatusOK, response)
 }
 
 func (f *fakeFoundation) writeBindingList(w http.ResponseWriter) {
@@ -273,6 +294,98 @@ func TestConnectPerformsTheFullV3FlowAndCleansUp(t *testing.T) {
 
 	// The temporary service key must be cleaned up even though the run failed.
 	assert.Positive(t, f.deleteCount(), "the temporary service key must be deleted on failure")
+}
+
+func TestWaitForServiceKeyCredentialsRetriesUntilTheHostIsAvailable(t *testing.T) {
+	f := newFakeFoundation(t)
+	f.credentialResponses = []string{
+		`{"credentials": {"status": "creation in progress"}}`,
+		`{"credentials": {
+			"host": "db.example.com", "port": 5432,
+			"db_name": "testdb", "username": "testuser", "password": "testpass"}}`,
+	}
+	client, err := api.NewClient(newStubConnection(f))
+	require.NoError(t, err)
+
+	creds, err := waitForServiceKeyCredentials(
+		context.Background(),
+		client,
+		testKeyGUID,
+		100*time.Millisecond,
+		10*time.Millisecond,
+		time.Millisecond,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, "db.example.com", creds.GetHost())
+	assert.Equal(t, 2, f.credentialRequests)
+}
+
+func TestWaitForServiceKeyCredentialsRetriesAnEmptyDetailsResponse(t *testing.T) {
+	f := newFakeFoundation(t)
+	f.credentialResponses = []string{
+		`{}`,
+		`{"credentials": {
+			"host": "db.example.com", "port": 5432,
+			"db_name": "testdb", "username": "testuser", "password": "testpass"}}`,
+	}
+	client, err := api.NewClient(newStubConnection(f))
+	require.NoError(t, err)
+
+	creds, err := waitForServiceKeyCredentials(
+		context.Background(),
+		client,
+		testKeyGUID,
+		100*time.Millisecond,
+		10*time.Millisecond,
+		time.Millisecond,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, "db.example.com", creds.GetHost())
+	assert.Equal(t, 2, f.credentialRequests)
+}
+
+func TestWaitForServiceKeyCredentialsRejectsMalformedCredentialsImmediately(t *testing.T) {
+	f := newFakeFoundation(t)
+	f.credentialResponses = []string{
+		`{"credentials": {"host": ["db.example.com"], "port": 5432}}`,
+	}
+	client, err := api.NewClient(newStubConnection(f))
+	require.NoError(t, err)
+
+	_, err = waitForServiceKeyCredentials(
+		context.Background(),
+		client,
+		testKeyGUID,
+		20*time.Millisecond,
+		10*time.Millisecond,
+		time.Millisecond,
+	)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "could not parse")
+	assert.Equal(t, 1, f.credentialRequests)
+}
+
+func TestWaitForServiceKeyCredentialsRetriesATimedOutDetailsRequest(t *testing.T) {
+	f := newFakeFoundation(t)
+	f.blockedCredentials = 1
+	client, err := api.NewClient(newStubConnection(f))
+	require.NoError(t, err)
+
+	creds, err := waitForServiceKeyCredentials(
+		context.Background(),
+		client,
+		testKeyGUID,
+		100*time.Millisecond,
+		5*time.Millisecond,
+		time.Millisecond,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, "db.example.com", creds.GetHost())
+	assert.Equal(t, 2, f.credentialRequests)
 }
 
 // A stopped app has no container to tunnel through. Failing early with a clear

@@ -95,6 +95,21 @@ func credentialsTests() []credentialsTest {
 			expectedUser:   "user",
 			expectedPass:   "pass",
 		},
+		{
+			name: "MongoDB Hosts array",
+			credsJSON: `{
+				"Hosts": ["mongo-0.example.com", "mongo-1.example.com"],
+				"database": "name",
+				"port": 27017,
+				"username": "user",
+				"password": "pass"
+			}`,
+			expectedHost:   "mongo-0.example.com",
+			expectedPort:   "27017",
+			expectedDBName: "name",
+			expectedUser:   "user",
+			expectedPass:   "pass",
+		},
 	}
 }
 

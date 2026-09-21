@@ -35,6 +35,10 @@ const jobPollTimeout = 5 * time.Minute
 // jobPollInterval is how often an in-flight job is re-checked.
 const jobPollInterval = 2 * time.Second
 
+// ErrServiceKeyCredentialsNotReady indicates that the binding exists but CAPI
+// has not exposed its credentials yet.
+var ErrServiceKeyCredentialsNotReady = errors.New("service key credentials are not ready")
+
 // Client provides the CAPI v3 operations required to connect to a service
 // instance. Construct one with NewClient.
 type Client struct {
@@ -456,7 +460,8 @@ func (c *Client) FindServiceKey(ctx context.Context, serviceInstanceGUID, keyNam
 //
 // Unlike v2's POST /v2/service_keys, the v3 endpoint is asynchronous: it
 // returns 202 with a job to poll. This method does not return until the job has
-// completed, so the credentials are guaranteed to be readable afterwards.
+// completed. Some brokers still expose credentials shortly after completion,
+// so callers must tolerate temporarily incomplete binding details.
 func (c *Client) CreateServiceKey(ctx context.Context, serviceInstanceGUID, keyName string) (string, error) {
 	cf, err := c.client()
 	if err != nil {
@@ -530,7 +535,11 @@ func (c *Client) GetServiceKeyCredentials(ctx context.Context, keyGUID string) (
 		return nil, fmt.Errorf("could not read the credentials of service key %s: %w", keyGUID, err)
 	}
 	if details == nil || len(details.Credentials) == 0 {
-		return nil, fmt.Errorf("service key %s has no credentials; this service may not support service keys", keyGUID)
+		return nil, fmt.Errorf(
+			"%w: service key %s has no credentials; this service may not support service keys",
+			ErrServiceKeyCredentialsNotReady,
+			keyGUID,
+		)
 	}
 	return details.Credentials, nil
 }

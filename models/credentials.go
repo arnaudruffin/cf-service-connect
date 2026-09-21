@@ -6,6 +6,10 @@ import (
 	"fmt"
 )
 
+// ErrIncompleteCredentials indicates that a service key exists but its
+// connection details are not ready yet.
+var ErrIncompleteCredentials = errors.New("service key credentials are incomplete")
+
 // Credentials exposes the connection details of a service instance.
 type Credentials interface {
 	GetDBName() string
@@ -21,13 +25,15 @@ type Credentials interface {
 // http://stackoverflow.com/a/28035946/358804
 type credentialsJSON struct {
 	// these groups of fields should be interchangeable
-	DBName string `json:"db_name"`
-	Dbname string `json:"dbname"`
-	Name   string `json:"name"`
+	DBName   string `json:"db_name"`
+	Dbname   string `json:"dbname"`
+	Name     string `json:"name"`
+	Database string `json:"database"`
 
-	Host     string `json:"host"`
-	Hostname string `json:"hostname"`
-	HostName string `json:"host_name"`
+	Host     string   `json:"host"`
+	Hostname string   `json:"hostname"`
+	HostName string   `json:"host_name"`
+	Hosts    []string `json:"hosts"`
 
 	Username string `json:"username"`
 	UserName string `json:"user_name"`
@@ -49,7 +55,10 @@ func (c credentialsJSON) GetDBName() string {
 	if c.Dbname != "" {
 		return c.Dbname
 	}
-	return c.DBName
+	if c.DBName != "" {
+		return c.DBName
+	}
+	return c.Database
 }
 
 func (c credentialsJSON) GetHost() string {
@@ -59,7 +68,13 @@ func (c credentialsJSON) GetHost() string {
 	if c.HostName != "" {
 		return c.HostName
 	}
-	return c.Hostname
+	if c.Hostname != "" {
+		return c.Hostname
+	}
+	if len(c.Hosts) > 0 {
+		return c.Hosts[0]
+	}
+	return ""
 }
 
 func (c credentialsJSON) GetUsername() string {
@@ -110,10 +125,10 @@ func CredentialsFromMap(raw map[string]any) (Credentials, error) {
 	// surface much later as a confusing connection failure, so check the fields
 	// the tunnel actually needs.
 	if creds.GetHost() == "" {
-		return nil, errors.New("the service key credentials contain no host; this service may not be supported")
+		return nil, fmt.Errorf("%w: the service key credentials contain no host; this service may not be supported", ErrIncompleteCredentials)
 	}
 	if creds.GetPort() == "" {
-		return nil, errors.New("the service key credentials contain no port; this service may not be supported")
+		return nil, fmt.Errorf("%w: the service key credentials contain no port; this service may not be supported", ErrIncompleteCredentials)
 	}
 
 	return creds, nil

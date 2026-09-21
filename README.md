@@ -124,6 +124,14 @@ authorization check failed rather than that the passcode was wrong. Check
 `cf ssh-enabled APP`, `cf space-ssh-allowed SPACE`, that the app has a running
 instance (`cf app APP`), and that you are targeting the right org and space.
 
+**Service key creation remains in progress** — some service brokers report that
+the key was created before its connection credentials are available. The plugin
+retries incomplete credentials for up to five minutes before failing and
+deleting the temporary key. Each credential request is limited to ten seconds,
+so a blocked request does not consume the entire retry period. MongoDB
+credentials that expose a `Hosts` array instead of a single `host` are also
+supported; the tunnel targets the first listed host.
+
 **`connection refused`, `error opening SSH connection`, or
 `psql: could not connect to server: Connection refused`** — this is usually caused by being on a network that blocks the SSH port that this tool is trying to use. Try using a different network, or consider asking your network administrator to unblock the port (typically 22 and/or 2222). On foundations that advertise the `app_ssh_ws` endpoint the plugin tunnels SSH over `wss://` on port 443 instead, which avoids this class of problem.
 
@@ -148,4 +156,3 @@ If you're using a non-default client (such as a GUI), run with the `-no-client` 
 ## Contributing
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md)
-

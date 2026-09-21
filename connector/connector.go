@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 	"text/template"
+	"time"
 
 	"code.cloudfoundry.org/cli/plugin"
 
@@ -33,8 +34,11 @@ const startedAppState = "STARTED"
 // default. These are named constants rather than literals so the intent is
 // visible at the call site.
 const (
-	sshProcessType   = "web"
-	sshInstanceIndex = 0
+	sshProcessType               = "web"
+	sshInstanceIndex             = 0
+	serviceKeyCredentialsTimeout = 5 * time.Minute
+	serviceKeyCredentialsRequest = 10 * time.Second
+	serviceKeyCredentialsPoll    = 2 * time.Second
 )
 
 const manualConnectInstructions = `Skipping call to client CLI. Connection information:
@@ -185,11 +189,15 @@ func connect(ctx context.Context, conn api.Connection, options Options) (err err
 		}
 	}()
 
-	rawCreds, err := client.GetServiceKeyCredentials(ctx, serviceKey.GUID)
-	if err != nil {
-		return err
-	}
-	creds, err := models.CredentialsFromMap(rawCreds)
+	fmt.Println("Waiting for the service key credentials...")
+	creds, err := waitForServiceKeyCredentials(
+		ctx,
+		client,
+		serviceKey.GUID,
+		serviceKeyCredentialsTimeout,
+		serviceKeyCredentialsRequest,
+		serviceKeyCredentialsPoll,
+	)
 	if err != nil {
 		return err
 	}
@@ -206,6 +214,69 @@ func connect(ctx context.Context, conn api.Connection, options Options) (err err
 	}()
 
 	return handleClient(options, tunnel, serviceInstance, creds)
+}
+
+func waitForServiceKeyCredentials(
+	ctx context.Context,
+	client *api.Client,
+	keyGUID string,
+	timeout time.Duration,
+	requestTimeout time.Duration,
+	pollInterval time.Duration,
+) (models.Credentials, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var credentialsErr error
+	for {
+		requestCtx, cancelRequest := context.WithTimeout(ctx, requestTimeout)
+		rawCredentials, err := client.GetServiceKeyCredentials(requestCtx, keyGUID)
+		requestErr := requestCtx.Err()
+		cancelRequest()
+
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, serviceKeyCredentialsContextError(ctx, timeout, err)
+			}
+			if errors.Is(requestErr, context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+				credentialsErr = err
+			} else if errors.Is(err, api.ErrServiceKeyCredentialsNotReady) {
+				credentialsErr = err
+			} else {
+				return nil, err
+			}
+		} else {
+			credentials, err := models.CredentialsFromMap(rawCredentials)
+			if err == nil {
+				return credentials, nil
+			}
+			if !errors.Is(err, models.ErrIncompleteCredentials) {
+				return nil, err
+			}
+			credentialsErr = err
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, serviceKeyCredentialsContextError(ctx, timeout, credentialsErr)
+		case <-time.After(pollInterval):
+		}
+	}
+}
+
+func serviceKeyCredentialsContextError(
+	ctx context.Context,
+	timeout time.Duration,
+	credentialsErr error,
+) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf(
+			"timed out after %s waiting for service key credentials: %w",
+			timeout,
+			credentialsErr,
+		)
+	}
+	return ctx.Err()
 }
 
 func deleteExistingServiceKey(ctx context.Context, client *api.Client, serviceKey models.ServiceKey) error {
