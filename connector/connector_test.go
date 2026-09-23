@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/cloud-gov/cf-service-connect/api"
+	"github.com/cloud-gov/cf-service-connect/models"
 )
 
 // testAppSSHFingerprint is a deliberately fake SSH host key fingerprint. It is
@@ -63,9 +65,12 @@ type fakeFoundation struct {
 	omitAppSSH bool
 
 	deletes             int
+	bindingCreated      bool
 	credentialResponses []string
 	credentialRequests  int
 	blockedCredentials  int
+	serviceSpaceGUID    string
+	appSpaceGUID        string
 }
 
 func newFakeFoundation(t *testing.T) *fakeFoundation {
@@ -122,7 +127,27 @@ func (f *fakeFoundation) route(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/oauth/authorize":
 		w.Header().Set("Location", "https://uaa.example.com/login?code=test-ssh-code")
 		w.WriteHeader(http.StatusFound)
+	case r.URL.Path == "/v3/spaces":
+		name := r.URL.Query().Get("names")
+		guid := ""
+		switch name {
+		case "service-space":
+			guid = "service-space-guid"
+		case "app-space":
+			guid = "app-space-guid"
+		}
+		if guid == "" {
+			writeRaw(w, http.StatusOK, `{"pagination":{"total_results":0,"total_pages":1,"first":{"href":""},"last":{"href":""},"next":null,"previous":null},"resources":[]}`)
+			return
+		}
+		writeRaw(w, http.StatusOK, fmt.Sprintf(`{
+			"pagination":{"total_results":1,"total_pages":1,"first":{"href":""},"last":{"href":""},"next":null,"previous":null},
+			"resources":[{"guid":%q,"name":%q}]
+		}`, guid, name))
 	case r.URL.Path == "/v3/service_instances":
+		f.mu.Lock()
+		f.serviceSpaceGUID = r.URL.Query().Get("space_guids")
+		f.mu.Unlock()
 		writeRaw(w, http.StatusOK, fmt.Sprintf(`{
 			"pagination": {"total_results": 1, "total_pages": 1, "first": {"href": ""}, "last": {"href": ""}, "next": null, "previous": null},
 			"resources": [{"guid": %q, "name": "my-test-service", "type": "managed",
@@ -134,6 +159,9 @@ func (f *fakeFoundation) route(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/v3/service_offerings/"+testOfferingGUID:
 		writeRaw(w, http.StatusOK, fmt.Sprintf(`{"guid": %q, "name": "aws-rds"}`, testOfferingGUID))
 	case r.URL.Path == "/v3/apps":
+		f.mu.Lock()
+		f.appSpaceGUID = r.URL.Query().Get("space_guids")
+		f.mu.Unlock()
 		writeRaw(w, http.StatusOK, fmt.Sprintf(`{
 			"pagination": {"total_results": 1, "total_pages": 1, "first": {"href": ""}, "last": {"href": ""}, "next": null, "previous": null},
 			"resources": [{"guid": %q, "name": "test-app", "state": %q}]
@@ -150,6 +178,9 @@ func (f *fakeFoundation) route(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/v3/service_credential_bindings" && r.Method == http.MethodGet:
 		f.writeBindingList(w)
 	case r.URL.Path == "/v3/service_credential_bindings" && r.Method == http.MethodPost:
+		f.mu.Lock()
+		f.bindingCreated = true
+		f.mu.Unlock()
 		writeRaw(w, http.StatusCreated, fmt.Sprintf(`{"guid": %q, "name": "SERVICE_CONNECT", "type": "key"}`, testKeyGUID))
 	case strings.HasSuffix(r.URL.Path, "/details"):
 		f.writeCredentials(w, r)
@@ -191,13 +222,21 @@ func (f *fakeFoundation) writeBindingList(w http.ResponseWriter) {
 	f.mu.Lock()
 	existing := f.existingKeyGUID
 	deleted := f.deletes > 0
+	created := f.bindingCreated
 	f.mu.Unlock()
 
-	// Before any delete, report the leftover key if one was configured.
-	// Afterwards, report the key the plugin just created.
-	guid := testKeyGUID
+	guid := ""
 	if existing != "" && !deleted {
 		guid = existing
+	} else if created {
+		guid = testKeyGUID
+	}
+	if guid == "" {
+		writeRaw(w, http.StatusOK, `{
+			"pagination": {"total_results": 0, "total_pages": 1, "first": {"href": ""}, "last": {"href": ""}, "next": null, "previous": null},
+			"resources": []
+		}`)
+		return
 	}
 
 	writeRaw(w, http.StatusOK, fmt.Sprintf(`{
@@ -255,9 +294,69 @@ func (c stubConnection) IsSSLDisabled() (bool, error) { return false, nil }
 func (c stubConnection) GetCurrentSpace() (api.Space, error) {
 	return api.Space{Guid: c.spaceGUID, Name: "test-space"}, nil
 }
+func (c stubConnection) GetCurrentOrg() (api.Organization, error) {
+	return api.Organization{Guid: "org-guid", Name: "test-org"}, nil
+}
 
 func newStubConnection(f *fakeFoundation) api.Connection {
 	return stubConnection{apiEndpoint: f.URL(), spaceGUID: "space-guid"}
+}
+
+func rawCredentials(t *testing.T, body string) map[string]any {
+	t.Helper()
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal([]byte(body), &raw))
+	return raw
+}
+
+func TestSelectCredentialHostPromptsForMultipleHosts(t *testing.T) {
+	creds, err := models.CredentialsFromMap(rawCredentials(t, `{
+		"hosts": ["mongo-0.example.com", "mongo-1.example.com", "mongo-2.example.com"],
+		"database": "name",
+		"port": 27017
+	}`))
+	require.NoError(t, err)
+
+	var output bytes.Buffer
+	selected, err := selectCredentialHost(creds, strings.NewReader("2\n"), &output)
+
+	require.NoError(t, err)
+	assert.Equal(t, "mongo-1.example.com", selected.GetHost())
+	assert.Contains(t, output.String(), "Multiple remote hosts found")
+	assert.Contains(t, output.String(), "1) mongo-0.example.com")
+	assert.Contains(t, output.String(), "2) mongo-1.example.com")
+	assert.Contains(t, output.String(), "3) mongo-2.example.com")
+}
+
+func TestSelectCredentialHostKeepsSingleHostWithoutPrompt(t *testing.T) {
+	creds, err := models.CredentialsFromMap(rawCredentials(t, `{
+		"host": "mongo-0.example.com",
+		"database": "name",
+		"port": 27017
+	}`))
+	require.NoError(t, err)
+
+	var output bytes.Buffer
+	selected, err := selectCredentialHost(creds, strings.NewReader(""), &output)
+
+	require.NoError(t, err)
+	assert.Equal(t, creds.GetHost(), selected.GetHost())
+	assert.Empty(t, output.String())
+}
+
+func TestSelectCredentialHostRejectsInvalidChoice(t *testing.T) {
+	creds, err := models.CredentialsFromMap(rawCredentials(t, `{
+		"hosts": ["mongo-0.example.com", "mongo-1.example.com"],
+		"database": "name",
+		"port": 27017
+	}`))
+	require.NoError(t, err)
+
+	_, err = selectCredentialHost(creds, strings.NewReader("3\n"), &bytes.Buffer{})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid host selection")
 }
 
 // The connect flow reaches the SSH dial, which cannot succeed against the fake
@@ -294,6 +393,27 @@ func TestConnectPerformsTheFullV3FlowAndCleansUp(t *testing.T) {
 
 	// The temporary service key must be cleaned up even though the run failed.
 	assert.Positive(t, f.deleteCount(), "the temporary service key must be deleted on failure")
+}
+
+func TestConnectResolvesAppAndServiceInDifferentSpaces(t *testing.T) {
+	f := newFakeFoundation(t)
+
+	err := connect(context.Background(), newStubConnection(f), Options{
+		App: ResourceReference{
+			Space: "app-space",
+			Name:  "test-app",
+		},
+		Service: ResourceReference{
+			Space: "service-space",
+			Name:  "my-test-service",
+		},
+		ConnectClient: false,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "SSH proxy")
+	assert.Equal(t, "app-space-guid", f.appSpaceGUID)
+	assert.Equal(t, "service-space-guid", f.serviceSpaceGUID)
 }
 
 func TestWaitForServiceKeyCredentialsRetriesUntilTheHostIsAvailable(t *testing.T) {
@@ -420,6 +540,38 @@ func TestConnectRemovesALeftoverServiceKey(t *testing.T) {
 	joined := strings.Join(f.requestedPaths(), "\n")
 	assert.Contains(t, joined, "DELETE /v3/service_credential_bindings/leftover-key-guid",
 		"a leftover key must be deleted before a new one is created")
+}
+
+func TestConnectReusesAndKeepsAnExistingServiceKey(t *testing.T) {
+	f := newFakeFoundation(t)
+	f.existingKeyGUID = "leftover-key-guid"
+
+	err := connect(context.Background(), newStubConnection(f), Options{
+		AppName:             "test-app",
+		ServiceInstanceName: "my-test-service",
+		KeepServiceKey:      true,
+	})
+
+	require.Error(t, err)
+	joined := strings.Join(f.requestedPaths(), "\n")
+	assert.NotContains(t, joined, "POST /v3/service_credential_bindings")
+	assert.NotContains(t, joined, "DELETE /v3/service_credential_bindings/")
+	assert.Contains(t, joined, "GET /v3/service_credential_bindings/leftover-key-guid/details")
+}
+
+func TestConnectKeepsANewServiceKey(t *testing.T) {
+	f := newFakeFoundation(t)
+
+	err := connect(context.Background(), newStubConnection(f), Options{
+		AppName:             "test-app",
+		ServiceInstanceName: "my-test-service",
+		KeepServiceKey:      true,
+	})
+
+	require.Error(t, err)
+	joined := strings.Join(f.requestedPaths(), "\n")
+	assert.Contains(t, joined, "POST /v3/service_credential_bindings")
+	assert.NotContains(t, joined, "DELETE /v3/service_credential_bindings/")
 }
 
 // Previously the pre-emptive delete's error was discarded, so a key that could

@@ -24,19 +24,76 @@ func TestParseOptions(t *testing.T) {
 			"connect-to-service app service",
 			false,
 			connector.Options{
-				AppName:             "app",
-				ServiceInstanceName: "service",
-				ConnectClient:       true,
+				App:           connector.ResourceReference{Name: "app"},
+				Service:       connector.ResourceReference{Name: "service"},
+				ConnectClient: true,
+			},
+		},
+		{
+			"connect-to-service app-space/app service-space/service",
+			false,
+			connector.Options{
+				App: connector.ResourceReference{
+					Space: "app-space",
+					Name:  "app",
+				},
+				Service: connector.ResourceReference{
+					Space: "service-space",
+					Name:  "service",
+				},
+				ConnectClient: true,
+			},
+		},
+		{
+			"connect-to-service app-org/app-space/app service-org/service-space/service/with/slashes",
+			false,
+			connector.Options{
+				App: connector.ResourceReference{
+					Organization: "app-org",
+					Space:        "app-space",
+					Name:         "app",
+				},
+				Service: connector.ResourceReference{
+					Organization: "service-org",
+					Space:        "service-space",
+					Name:         "service/with/slashes",
+				},
+				ConnectClient: true,
 			},
 		},
 		{
 			"connect-to-service -no-client app service",
 			false,
 			connector.Options{
-				AppName:             "app",
-				ServiceInstanceName: "service",
-				ConnectClient:       false,
+				App:           connector.ResourceReference{Name: "app"},
+				Service:       connector.ResourceReference{Name: "service"},
+				ConnectClient: false,
 			},
+		},
+		{
+			"connect-to-service -keep-service-key app service",
+			false,
+			connector.Options{
+				App:            connector.ResourceReference{Name: "app"},
+				Service:        connector.ResourceReference{Name: "service"},
+				ConnectClient:  true,
+				KeepServiceKey: true,
+			},
+		},
+		{
+			"connect-to-service /app service",
+			true,
+			connector.Options{},
+		},
+		{
+			"connect-to-service org//app service",
+			true,
+			connector.Options{},
+		},
+		{
+			"connect-to-service org/space/ service",
+			true,
+			connector.Options{},
 		},
 		{
 			"connect-to-service foo bar baz",
@@ -67,6 +124,13 @@ func TestMetadataVersionMatchesTheAPIUserAgent(t *testing.T) {
 		metadata.Version.Major, metadata.Version.Minor, metadata.Version.Build)
 
 	assert.Contains(t, api.UserAgent(), "cf-service-connect/"+advertised)
+}
+
+func TestMetadataDocumentsQualifiedResourceSyntax(t *testing.T) {
+	usage := (&ServiceConnectPlugin{}).GetMetadata().Commands[0].UsageDetails.Usage
+
+	assert.Contains(t, usage, "APP|SPACE/APP|ORG/SPACE/APP")
+	assert.Contains(t, usage, "SERVICE|SPACE/SERVICE|ORG/SPACE/SERVICE")
 }
 
 func TestMetadataVersionIsAtLeastV2(t *testing.T) {

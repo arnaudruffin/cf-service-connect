@@ -153,6 +153,97 @@ func TestNewClientPropagatesConnectionErrors(t *testing.T) {
 	})
 }
 
+func TestResolveSpaceGUIDUsesCurrentSpaceWithoutQualifiers(t *testing.T) {
+	f := newFakeCF(t)
+	client, _ := newTestClient(t, f)
+
+	guid, err := client.ResolveSpaceGUID(context.Background(), "", "")
+
+	require.NoError(t, err)
+	assert.Equal(t, "space-guid", guid)
+}
+
+func TestResolveSpaceGUIDFindsSpaceInCurrentOrganization(t *testing.T) {
+	f := newFakeCF(t)
+	var query string
+	f.handle("GET /v3/spaces", func(w http.ResponseWriter, r *http.Request) {
+		query = r.URL.RawQuery
+		writeRaw(w, http.StatusOK, `{
+			"pagination":{"total_results":1,"total_pages":1,"first":{"href":""},"last":{"href":""},"next":null,"previous":null},
+			"resources":[{"guid":"other-space-guid","name":"other-space"}]
+		}`)
+	})
+	client, _ := newTestClient(t, f)
+
+	guid, err := client.ResolveSpaceGUID(context.Background(), "", "other-space")
+
+	require.NoError(t, err)
+	assert.Equal(t, "other-space-guid", guid)
+	assert.Contains(t, query, "names=other-space")
+	assert.Contains(t, query, "organization_guids=org-guid")
+}
+
+func TestResolveSpaceGUIDFindsSpaceInNamedOrganization(t *testing.T) {
+	f := newFakeCF(t)
+	var organizationQuery string
+	var spaceQuery string
+	f.handle("GET /v3/organizations", func(w http.ResponseWriter, r *http.Request) {
+		organizationQuery = r.URL.RawQuery
+		writeRaw(w, http.StatusOK, `{
+			"pagination":{"total_results":1,"total_pages":1,"first":{"href":""},"last":{"href":""},"next":null,"previous":null},
+			"resources":[{"guid":"other-org-guid","name":"other-org"}]
+		}`)
+	})
+	f.handle("GET /v3/spaces", func(w http.ResponseWriter, r *http.Request) {
+		spaceQuery = r.URL.RawQuery
+		writeRaw(w, http.StatusOK, `{
+			"pagination":{"total_results":1,"total_pages":1,"first":{"href":""},"last":{"href":""},"next":null,"previous":null},
+			"resources":[{"guid":"other-space-guid","name":"other-space"}]
+		}`)
+	})
+	client, _ := newTestClient(t, f)
+
+	guid, err := client.ResolveSpaceGUID(context.Background(), "other-org", "other-space")
+
+	require.NoError(t, err)
+	assert.Equal(t, "other-space-guid", guid)
+	assert.Contains(t, organizationQuery, "names=other-org")
+	assert.Contains(t, spaceQuery, "names=other-space")
+	assert.Contains(t, spaceQuery, "organization_guids=other-org-guid")
+}
+
+func TestResolveSpaceGUIDReportsMissingOrganization(t *testing.T) {
+	f := newFakeCF(t)
+	f.handle("GET /v3/organizations", func(w http.ResponseWriter, _ *http.Request) {
+		writeRaw(w, http.StatusOK, `{
+			"pagination":{"total_results":0,"total_pages":1,"first":{"href":""},"last":{"href":""},"next":null,"previous":null},
+			"resources":[]
+		}`)
+	})
+	client, _ := newTestClient(t, f)
+
+	_, err := client.ResolveSpaceGUID(context.Background(), "missing-org", "some-space")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `organization "missing-org" not found`)
+}
+
+func TestResolveSpaceGUIDReportsMissingSpaceInOrganization(t *testing.T) {
+	f := newFakeCF(t)
+	f.handle("GET /v3/spaces", func(w http.ResponseWriter, _ *http.Request) {
+		writeRaw(w, http.StatusOK, `{
+			"pagination":{"total_results":0,"total_pages":1,"first":{"href":""},"last":{"href":""},"next":null,"previous":null},
+			"resources":[]
+		}`)
+	})
+	client, _ := newTestClient(t, f)
+
+	_, err := client.ResolveSpaceGUID(context.Background(), "", "missing-space")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `space "missing-space" not found in organization "test-org"`)
+}
+
 func TestGetServiceInstanceResolvesPlanAndOffering(t *testing.T) {
 	f := newFakeCF(t)
 	stubServiceInstance(f, testPlanGUID)
@@ -258,6 +349,21 @@ func TestGetServiceInstanceScopesToTargetedSpace(t *testing.T) {
 	assert.Contains(t, query, "names=my-test-service")
 }
 
+func TestGetServiceInstanceInSpaceUsesSpecifiedSpace(t *testing.T) {
+	f := newFakeCF(t)
+	var query string
+	f.handle("GET /v3/service_instances", func(w http.ResponseWriter, r *http.Request) {
+		query = r.URL.RawQuery
+		writeRaw(w, http.StatusOK, serviceInstanceListJSON(""))
+	})
+
+	client, _ := newTestClient(t, f)
+	_, err := client.GetServiceInstanceInSpace(context.Background(), "my-test-service", "service-space-guid")
+	require.NoError(t, err)
+
+	assert.Contains(t, query, "space_guids=service-space-guid")
+}
+
 func TestGetApp(t *testing.T) {
 	f := newFakeCF(t)
 	f.handle("GET /v3/apps", func(w http.ResponseWriter, _ *http.Request) {
@@ -272,6 +378,21 @@ func TestGetApp(t *testing.T) {
 	assert.Equal(t, testAppGUID, app.GUID)
 	assert.Equal(t, "test-app", app.Name)
 	assert.Equal(t, "STARTED", app.State)
+}
+
+func TestGetAppInSpaceUsesSpecifiedSpace(t *testing.T) {
+	f := newFakeCF(t)
+	var query string
+	f.handle("GET /v3/apps", func(w http.ResponseWriter, r *http.Request) {
+		query = r.URL.RawQuery
+		writeRaw(w, http.StatusOK, appListJSON("STARTED"))
+	})
+
+	client, _ := newTestClient(t, f)
+	_, err := client.GetAppInSpace(context.Background(), "test-app", "app-space-guid")
+	require.NoError(t, err)
+
+	assert.Contains(t, query, "space_guids=app-space-guid")
 }
 
 func TestGetAppNotFound(t *testing.T) {

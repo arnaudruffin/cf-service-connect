@@ -23,6 +23,12 @@ func (c *ServiceConnectPlugin) parseOptions(args []string) (options connector.Op
 	flags := flag.NewFlagSet(command.Name, flag.ExitOnError)
 	option := "no-client"
 	noClient := flags.Bool(option, false, command.UsageDetails.Options[option])
+	keepServiceKeyOption := "keep-service-key"
+	keepServiceKey := flags.Bool(
+		keepServiceKeyOption,
+		false,
+		command.UsageDetails.Options[keepServiceKeyOption],
+	)
 
 	err = flags.Parse(args[1:])
 	if err != nil {
@@ -35,10 +41,20 @@ func (c *ServiceConnectPlugin) parseOptions(args []string) (options connector.Op
 		return
 	}
 
+	app, err := connector.ParseResourceReference(nonFlagArgs[0])
+	if err != nil {
+		return connector.Options{}, err
+	}
+	service, err := connector.ParseResourceReference(nonFlagArgs[1])
+	if err != nil {
+		return connector.Options{}, err
+	}
+
 	options = connector.Options{
-		AppName:             nonFlagArgs[0],
-		ServiceInstanceName: nonFlagArgs[1],
-		ConnectClient:       !(*noClient),
+		App:            app,
+		Service:        service,
+		ConnectClient:  !(*noClient),
+		KeepServiceKey: *keepServiceKey,
 	}
 	return
 }
@@ -107,9 +123,11 @@ func (c *ServiceConnectPlugin) GetMetadata() plugin.PluginMetadata {
 				Name:     subcommand,
 				HelpText: "Open a shell that's connected to a database service instance",
 				UsageDetails: plugin.Usage{
-					Usage: "\n   cf " + subcommand + " [-no-client] <app_name> <service_instance_name>",
+					Usage: "\n   cf " + subcommand + " [-no-client] [-keep-service-key] " +
+						"<APP|SPACE/APP|ORG/SPACE/APP> <SERVICE|SPACE/SERVICE|ORG/SPACE/SERVICE>",
 					Options: map[string]string{
-						"no-client": "If this param is passed, the CLI client for the service won't be started, and the connection information will be printed to the console. Useful for connecting to the service through a GUI.",
+						"no-client":        "If this param is passed, the CLI client for the service won't be started, and the connection information will be printed to the console. Useful for connecting to the service through a GUI.",
+						"keep-service-key": "Keep and reuse the temporary service key instead of deleting and recreating it.",
 					},
 				},
 			},

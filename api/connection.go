@@ -29,6 +29,16 @@ type Connection interface {
 
 	// GetCurrentSpace returns the targeted space. Only the GUID is used.
 	GetCurrentSpace() (Space, error)
+
+	// GetCurrentOrg returns the targeted organization.
+	GetCurrentOrg() (Organization, error)
+}
+
+// Organization mirrors the fields of plugin_models.Organization that this
+// plugin needs.
+type Organization struct {
+	Guid string //nolint:revive // field name matches plugin_models.Organization
+	Name string
 }
 
 // Space mirrors the fields of plugin_models.Space that this plugin needs.

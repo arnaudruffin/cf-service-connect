@@ -17,6 +17,7 @@ type redisMatchTest struct {
 
 type mockCredentials struct {
 	mockPassword string
+	mockTLS      bool
 }
 
 func (m mockCredentials) GetPassword() string {
@@ -35,8 +36,16 @@ func (m mockCredentials) GetHost() string {
 	return ""
 }
 
+func (m mockCredentials) GetHosts() []string {
+	return nil
+}
+
 func (m mockCredentials) GetPort() string {
 	return ""
+}
+
+func (m mockCredentials) UsesTLS() bool {
+	return m.mockTLS
 }
 
 func TestRedisMatch(t *testing.T) {

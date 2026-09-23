@@ -206,6 +206,8 @@ func testAccessToken(validFor time.Duration) string {
 // fakeConnection is a stub plugin connection.
 type fakeConnection struct {
 	apiEndpoint string
+	orgGUID     string
+	orgName     string
 	spaceGUID   string
 	spaceName   string
 	sslDisabled bool
@@ -225,6 +227,8 @@ type fakeConnection struct {
 func newFakeConnection(f *fakeCF) *fakeConnection {
 	return &fakeConnection{
 		apiEndpoint: f.URL(),
+		orgGUID:     "org-guid",
+		orgName:     "test-org",
 		spaceGUID:   "space-guid",
 		spaceName:   "test-space",
 		tokens:      []string{testAccessToken(time.Hour)},
@@ -265,6 +269,10 @@ func (c *fakeConnection) GetCurrentSpace() (Space, error) {
 		return Space{}, c.spaceErr
 	}
 	return Space{Guid: c.spaceGUID, Name: c.spaceName}, nil
+}
+
+func (c *fakeConnection) GetCurrentOrg() (Organization, error) {
+	return Organization{Guid: c.orgGUID, Name: c.orgName}, nil
 }
 
 func newTestClient(t *testing.T, f *fakeCF) (*Client, *fakeConnection) {

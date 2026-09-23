@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 )
 
 // ErrIncompleteCredentials indicates that a service key exists but its
@@ -14,9 +16,11 @@ var ErrIncompleteCredentials = errors.New("service key credentials are incomplet
 type Credentials interface {
 	GetDBName() string
 	GetHost() string
+	GetHosts() []string
 	GetUsername() string
 	GetPassword() string
 	GetPort() string
+	UsesTLS() bool
 }
 
 // credentialsJSON accommodates the differing field names that service brokers
@@ -41,6 +45,7 @@ type credentialsJSON struct {
 
 	Password string `json:"password"`
 	Pass     string `json:"pass"`
+	URI      string `json:"uri"`
 	///////////////////////////////////////////////////
 
 	// can be an integer or a string
@@ -62,19 +67,27 @@ func (c credentialsJSON) GetDBName() string {
 }
 
 func (c credentialsJSON) GetHost() string {
-	if c.Host != "" {
-		return c.Host
-	}
-	if c.HostName != "" {
-		return c.HostName
-	}
-	if c.Hostname != "" {
-		return c.Hostname
-	}
-	if len(c.Hosts) > 0 {
-		return c.Hosts[0]
+	hosts := c.GetHosts()
+	if len(hosts) > 0 {
+		return hosts[0]
 	}
 	return ""
+}
+
+func (c credentialsJSON) GetHosts() []string {
+	if c.Host != "" {
+		return []string{c.Host}
+	}
+	if c.HostName != "" {
+		return []string{c.HostName}
+	}
+	if c.Hostname != "" {
+		return []string{c.Hostname}
+	}
+	if len(c.Hosts) > 0 {
+		return append([]string(nil), c.Hosts...)
+	}
+	return nil
 }
 
 func (c credentialsJSON) GetUsername() string {
@@ -96,6 +109,37 @@ func (c credentialsJSON) GetPassword() string {
 
 func (c credentialsJSON) GetPort() string {
 	return c.Port.String()
+}
+
+func (c credentialsJSON) UsesTLS() bool {
+	queryStart := strings.LastIndex(c.URI, "?")
+	if queryStart == -1 {
+		return false
+	}
+	query, err := url.ParseQuery(c.URI[queryStart+1:])
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(query.Get("tls"), "true") ||
+		strings.EqualFold(query.Get("ssl"), "true")
+}
+
+type selectedHostCredentials struct {
+	Credentials
+	host string
+}
+
+func (c selectedHostCredentials) GetHost() string {
+	return c.host
+}
+
+// CredentialsWithHost returns credentials that keep every original credential
+// field while using host as the tunnel destination.
+func CredentialsWithHost(creds Credentials, host string) Credentials {
+	return selectedHostCredentials{
+		Credentials: creds,
+		host:        host,
+	}
 }
 
 // CredentialsFromMap converts the credentials object returned by

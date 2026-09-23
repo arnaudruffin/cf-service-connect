@@ -1,11 +1,15 @@
 package connector
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"text/template"
 	"time"
@@ -21,9 +25,39 @@ import (
 // Options are the structured representation of the command-line
 // flags/arguments.
 type Options struct {
+	App                 ResourceReference
+	Service             ResourceReference
 	AppName             string
 	ServiceInstanceName string
 	ConnectClient       bool
+	KeepServiceKey      bool
+}
+
+// ResourceReference identifies an app or service, optionally outside the
+// currently targeted organization and space.
+type ResourceReference struct {
+	Organization string
+	Space        string
+	Name         string
+}
+
+// ParseResourceReference parses name, space/name, or org/space/name.
+func ParseResourceReference(value string) (ResourceReference, error) {
+	parts := strings.SplitN(value, "/", 3)
+	for _, part := range parts {
+		if part == "" {
+			return ResourceReference{}, fmt.Errorf("invalid resource reference %q: organization, space, and name must not be empty", value)
+		}
+	}
+
+	switch len(parts) {
+	case 1:
+		return ResourceReference{Name: parts[0]}, nil
+	case 2:
+		return ResourceReference{Space: parts[0], Name: parts[1]}, nil
+	default:
+		return ResourceReference{Organization: parts[0], Space: parts[1], Name: parts[2]}, nil
+	}
 }
 
 // startedAppState is the CF app state that indicates the operator wants the app
@@ -115,6 +149,36 @@ func handleClient(
 	return manualConnect(tunnel, creds)
 }
 
+func selectCredentialHost(creds models.Credentials, in io.Reader, out io.Writer) (models.Credentials, error) {
+	hosts := creds.GetHosts()
+	if len(hosts) <= 1 {
+		return creds, nil
+	}
+
+	fmt.Fprintln(out, "Multiple remote hosts found:")
+	for index, host := range hosts {
+		fmt.Fprintf(out, "  %d) %s\n", index+1, host)
+	}
+	fmt.Fprintf(out, "Choose host [1-%d] (default 1): ", len(hosts))
+
+	choice, err := bufio.NewReader(in).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("could not read host selection: %w", err)
+	}
+
+	choice = strings.TrimSpace(choice)
+	if choice == "" {
+		return models.CredentialsWithHost(creds, hosts[0]), nil
+	}
+
+	selected, err := strconv.Atoi(choice)
+	if err != nil || selected < 1 || selected > len(hosts) {
+		return nil, fmt.Errorf("invalid host selection %q: choose a number between 1 and %d", choice, len(hosts))
+	}
+
+	return models.CredentialsWithHost(creds, hosts[selected-1]), nil
+}
+
 // Connect performs the primary action of the plugin: providing an SSH tunnel
 // and launching the appropriate client, if desired.
 func Connect(cliConnection plugin.CliConnection, options Options) error {
@@ -129,8 +193,34 @@ func connect(ctx context.Context, conn api.Connection, options Options) (err err
 		return err
 	}
 
+	appReference := options.App
+	if appReference.Name == "" {
+		appReference.Name = options.AppName
+	}
+	serviceReference := options.Service
+	if serviceReference.Name == "" {
+		serviceReference.Name = options.ServiceInstanceName
+	}
+
+	serviceSpaceGUID, err := client.ResolveSpaceGUID(
+		ctx,
+		serviceReference.Organization,
+		serviceReference.Space,
+	)
+	if err != nil {
+		return fmt.Errorf("could not resolve service location: %w", err)
+	}
+	appSpaceGUID, err := client.ResolveSpaceGUID(
+		ctx,
+		appReference.Organization,
+		appReference.Space,
+	)
+	if err != nil {
+		return fmt.Errorf("could not resolve app location: %w", err)
+	}
+
 	fmt.Println("Finding the service instance details...")
-	instance, err := client.GetServiceInstance(ctx, options.ServiceInstanceName)
+	instance, err := client.GetServiceInstanceInSpace(ctx, serviceReference.Name, serviceSpaceGUID)
 	if err != nil {
 		return err
 	}
@@ -141,7 +231,7 @@ func connect(ctx context.Context, conn api.Connection, options Options) (err err
 		Plan:    instance.Plan,
 	}
 
-	app, err := client.GetApp(ctx, options.AppName)
+	app, err := client.GetAppInSpace(ctx, appReference.Name, appSpaceGUID)
 	if err != nil {
 		return err
 	}
@@ -161,33 +251,26 @@ func connect(ctx context.Context, conn api.Connection, options Options) (err err
 
 	serviceKey := models.NewServiceKey(serviceInstance)
 
-	// Clean up a key left behind by an earlier interrupted run. Unlike before,
-	// a failure here is reported: it usually means the key exists but cannot be
-	// deleted, in which case the create below would fail with a less obvious
-	// "already exists" error.
-	if err := deleteExistingServiceKey(ctx, client, serviceKey); err != nil {
-		return err
-	}
-
-	fmt.Println("Creating the service key...")
-	serviceKey.GUID, err = client.CreateServiceKey(ctx, serviceKey.Instance.GUID, serviceKey.Name)
+	serviceKey.GUID, err = prepareServiceKey(ctx, client, serviceKey, options.KeepServiceKey)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		fmt.Println("Deleting the service key...")
-		if deleteErr := client.DeleteServiceKey(ctx, serviceKey.GUID); deleteErr != nil {
-			// Report but do not mask the primary error: a leaked key is worth
-			// telling the user about, since they may need to remove it by hand
-			// before the next run.
-			fmt.Fprintf(os.Stderr,
-				"Warning: could not delete the temporary service key %q: %v\nRemove it with: cf delete-service-key %s %s\n",
-				serviceKey.Name, deleteErr, serviceKey.Instance.Name, serviceKey.Name)
-			if err == nil {
-				err = deleteErr
+	if !options.KeepServiceKey {
+		defer func() {
+			fmt.Println("Deleting the service key...")
+			if deleteErr := client.DeleteServiceKey(ctx, serviceKey.GUID); deleteErr != nil {
+				// Report but do not mask the primary error: a leaked key is worth
+				// telling the user about, since they may need to remove it by hand
+				// before the next run.
+				fmt.Fprintf(os.Stderr,
+					"Warning: could not delete the temporary service key %q: %v\nRemove it with: cf delete-service-key %s %s\n",
+					serviceKey.Name, deleteErr, serviceKey.Instance.Name, serviceKey.Name)
+				if err == nil {
+					err = deleteErr
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	fmt.Println("Waiting for the service key credentials...")
 	creds, err := waitForServiceKeyCredentials(
@@ -198,6 +281,11 @@ func connect(ctx context.Context, conn api.Connection, options Options) (err err
 		serviceKeyCredentialsRequest,
 		serviceKeyCredentialsPoll,
 	)
+	if err != nil {
+		return err
+	}
+
+	creds, err = selectCredentialHost(creds, os.Stdin, os.Stdout)
 	if err != nil {
 		return err
 	}
@@ -214,6 +302,29 @@ func connect(ctx context.Context, conn api.Connection, options Options) (err err
 	}()
 
 	return handleClient(options, tunnel, serviceInstance, creds)
+}
+
+func prepareServiceKey(
+	ctx context.Context,
+	client *api.Client,
+	serviceKey models.ServiceKey,
+	keep bool,
+) (string, error) {
+	if keep {
+		guid, found, err := client.FindServiceKey(ctx, serviceKey.Instance.GUID, serviceKey.Name)
+		if err != nil {
+			return "", err
+		}
+		if found {
+			fmt.Printf("Reusing the service key %q...\n", serviceKey.Name)
+			return guid, nil
+		}
+	} else if err := deleteExistingServiceKey(ctx, client, serviceKey); err != nil {
+		return "", err
+	}
+
+	fmt.Println("Creating the service key...")
+	return client.CreateServiceKey(ctx, serviceKey.Instance.GUID, serviceKey.Name)
 }
 
 func waitForServiceKeyCredentials(

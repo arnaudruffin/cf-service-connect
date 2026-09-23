@@ -47,9 +47,11 @@ type Client struct {
 	// to obtain one.
 	tokenFunc func() (string, error)
 
-	spaceGUID   string
-	apiURL      string
-	sslDisabled bool
+	organizationGUID string
+	organizationName string
+	spaceGUID        string
+	apiURL           string
+	sslDisabled      bool
 
 	// pollInterval is how often an in-flight job is re-checked. It is a field
 	// rather than a constant so that tests can shorten it.
@@ -83,17 +85,27 @@ func NewClient(conn Connection) (*Client, error) {
 		return nil, errors.New("no space is targeted; use `cf target -o ORG -s SPACE` first")
 	}
 
+	organization, err := conn.GetCurrentOrg()
+	if err != nil {
+		return nil, fmt.Errorf("could not determine the targeted organization: %w", err)
+	}
+	if organization.Guid == "" {
+		return nil, errors.New("no organization is targeted; use `cf target -o ORG -s SPACE` first")
+	}
+
 	sslDisabled, err := conn.IsSSLDisabled()
 	if err != nil {
 		return nil, fmt.Errorf("could not determine the TLS validation setting: %w", err)
 	}
 
 	c := &Client{
-		tokenFunc:    conn.AccessToken,
-		spaceGUID:    space.Guid,
-		apiURL:       apiURL,
-		sslDisabled:  sslDisabled,
-		pollInterval: jobPollInterval,
+		tokenFunc:        conn.AccessToken,
+		organizationGUID: organization.Guid,
+		organizationName: organization.Name,
+		spaceGUID:        space.Guid,
+		apiURL:           apiURL,
+		sslDisabled:      sslDisabled,
+		pollInterval:     jobPollInterval,
 	}
 
 	// Build eagerly so that an unusable session (not logged in, unreachable
@@ -104,6 +116,47 @@ func NewClient(conn Connection) (*Client, error) {
 
 	logger.Debugf("CAPI v3 client targeting %s, space %s (%s)\n", apiURL, space.Name, space.Guid)
 	return c, nil
+}
+
+// ResolveSpaceGUID resolves an optional organization and space qualifier. With
+// no qualifiers it returns the currently targeted space.
+func (c *Client) ResolveSpaceGUID(ctx context.Context, organizationName, spaceName string) (string, error) {
+	if organizationName == "" && spaceName == "" {
+		return c.spaceGUID, nil
+	}
+
+	cf, err := c.client()
+	if err != nil {
+		return "", err
+	}
+
+	organizationGUID := c.organizationGUID
+	resolvedOrganizationName := c.organizationName
+	if organizationName != "" {
+		opts := client.NewOrganizationListOptions()
+		opts.Names.EqualTo(organizationName)
+		organizations, err := cf.Organizations.ListAll(ctx, opts)
+		if err != nil {
+			return "", fmt.Errorf("could not look up organization %q: %w", organizationName, err)
+		}
+		if len(organizations) == 0 {
+			return "", fmt.Errorf("organization %q not found", organizationName)
+		}
+		organizationGUID = organizations[0].GUID
+		resolvedOrganizationName = organizations[0].Name
+	}
+
+	opts := client.NewSpaceListOptions()
+	opts.Names.EqualTo(spaceName)
+	opts.OrganizationGUIDs.EqualTo(organizationGUID)
+	spaces, err := cf.Spaces.ListAll(ctx, opts)
+	if err != nil {
+		return "", fmt.Errorf("could not look up space %q in organization %q: %w", spaceName, resolvedOrganizationName, err)
+	}
+	if len(spaces) == 0 {
+		return "", fmt.Errorf("space %q not found in organization %q", spaceName, resolvedOrganizationName)
+	}
+	return spaces[0].GUID, nil
 }
 
 // client returns the underlying go-cfclient, rebuilding it with a fresh token
@@ -221,6 +274,12 @@ func (p SSHProcess) SSHUsername() string {
 // GetServiceInstance looks up a managed or user-provided service instance by
 // name in the targeted space, along with its plan and offering names.
 func (c *Client) GetServiceInstance(ctx context.Context, name string) (ServiceInstance, error) {
+	return c.GetServiceInstanceInSpace(ctx, name, c.spaceGUID)
+}
+
+// GetServiceInstanceInSpace looks up a managed or user-provided service
+// instance by name in the specified space.
+func (c *Client) GetServiceInstanceInSpace(ctx context.Context, name, spaceGUID string) (ServiceInstance, error) {
 	cf, err := c.client()
 	if err != nil {
 		return ServiceInstance{}, err
@@ -228,7 +287,7 @@ func (c *Client) GetServiceInstance(ctx context.Context, name string) (ServiceIn
 
 	opts := client.NewServiceInstanceListOptions()
 	opts.Names.EqualTo(name)
-	opts.SpaceGUIDs.EqualTo(c.spaceGUID)
+	opts.SpaceGUIDs.EqualTo(spaceGUID)
 
 	instances, err := cf.ServiceInstances.ListAll(ctx, opts)
 	if err != nil {
@@ -291,6 +350,11 @@ func (c *Client) GetServiceInstance(ctx context.Context, name string) (ServiceIn
 
 // GetApp looks up an app by name in the targeted space.
 func (c *Client) GetApp(ctx context.Context, name string) (App, error) {
+	return c.GetAppInSpace(ctx, name, c.spaceGUID)
+}
+
+// GetAppInSpace looks up an app by name in the specified space.
+func (c *Client) GetAppInSpace(ctx context.Context, name, spaceGUID string) (App, error) {
 	cf, err := c.client()
 	if err != nil {
 		return App{}, err
@@ -298,7 +362,7 @@ func (c *Client) GetApp(ctx context.Context, name string) (App, error) {
 
 	opts := client.NewAppListOptions()
 	opts.Names.EqualTo(name)
-	opts.SpaceGUIDs.EqualTo(c.spaceGUID)
+	opts.SpaceGUIDs.EqualTo(spaceGUID)
 
 	apps, err := cf.Applications.ListAll(ctx, opts)
 	if err != nil {

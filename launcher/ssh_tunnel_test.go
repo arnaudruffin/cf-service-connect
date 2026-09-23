@@ -163,9 +163,11 @@ type stubCredentials struct {
 
 func (s stubCredentials) GetDBName() string   { return "testdb" }
 func (s stubCredentials) GetHost() string     { return s.host }
+func (s stubCredentials) GetHosts() []string  { return []string{s.host} }
 func (s stubCredentials) GetUsername() string { return "testuser" }
 func (s stubCredentials) GetPassword() string { return "testpass" }
 func (s stubCredentials) GetPort() string     { return s.port }
+func (s stubCredentials) UsesTLS() bool       { return false }
 
 func TestSSHTunnelForwardsTraffic(t *testing.T) {
 	server := newForwardingSSHServer(t)

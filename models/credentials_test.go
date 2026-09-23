@@ -27,6 +27,7 @@ type credentialsTest struct {
 	expectedDBName string
 	expectedUser   string
 	expectedPass   string
+	expectedTLS    bool
 }
 
 // The broker field names below are all in active use; the plugin has to accept
@@ -102,13 +103,15 @@ func credentialsTests() []credentialsTest {
 				"database": "name",
 				"port": 27017,
 				"username": "user",
-				"password": "pass"
+				"password": "pass",
+				"Uri": "mongodb://user:pass@mongo-0.example.com:27017/name?tls=true"
 			}`,
 			expectedHost:   "mongo-0.example.com",
 			expectedPort:   "27017",
 			expectedDBName: "name",
 			expectedUser:   "user",
 			expectedPass:   "pass",
+			expectedTLS:    true,
 		},
 	}
 }
@@ -124,8 +127,57 @@ func TestCredentialsFromMap(t *testing.T) {
 			assert.Equal(t, test.expectedDBName, creds.GetDBName())
 			assert.Equal(t, test.expectedUser, creds.GetUsername())
 			assert.Equal(t, test.expectedPass, creds.GetPassword())
+			assert.Equal(t, test.expectedTLS, creds.UsesTLS())
 		})
 	}
+}
+
+func TestCredentialsFromMapPreservesAllHosts(t *testing.T) {
+	creds, err := CredentialsFromMap(credentialsMap(t, `{
+		"hosts": ["mongo-0.example.com", "mongo-1.example.com", "mongo-2.example.com"],
+		"database": "name",
+		"port": 27017
+	}`))
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"mongo-0.example.com",
+		"mongo-1.example.com",
+		"mongo-2.example.com",
+	}, creds.GetHosts())
+}
+
+func TestCredentialsWithHostOverridesOnlyTheHost(t *testing.T) {
+	creds, err := CredentialsFromMap(credentialsMap(t, `{
+		"hosts": ["mongo-0.example.com", "mongo-1.example.com"],
+		"database": "name",
+		"port": 27017,
+		"username": "user",
+		"password": "pass",
+		"uri": "mongodb://mongo-0.example.com:27017/name?tls=true"
+	}`))
+	require.NoError(t, err)
+
+	selected := CredentialsWithHost(creds, "mongo-1.example.com")
+
+	assert.Equal(t, "mongo-1.example.com", selected.GetHost())
+	assert.Equal(t, []string{"mongo-0.example.com", "mongo-1.example.com"}, selected.GetHosts())
+	assert.Equal(t, "27017", selected.GetPort())
+	assert.Equal(t, "name", selected.GetDBName())
+	assert.Equal(t, "user", selected.GetUsername())
+	assert.Equal(t, "pass", selected.GetPassword())
+	assert.True(t, selected.UsesTLS())
+}
+
+func TestCredentialsDetectTLSWithUnescapedURIUserInfo(t *testing.T) {
+	creds, err := CredentialsFromMap(credentialsMap(t, `{
+		"host": "mongo.example.com",
+		"port": 27017,
+		"uri": "mongodb://user:p%ss@mongo.example.com:27017/name?tls=true"
+	}`))
+
+	require.NoError(t, err)
+	assert.True(t, creds.UsesTLS())
 }
 
 // A v2-shaped payload has no usable host at the top level, because v2 nested the

@@ -83,14 +83,30 @@ means the plugin keeps working on foundations that have closed port 2222.
 ## Usage
 
 > **Note**
-> If you are using this tool to connect to a service on cloud.gov, your space must be configured with the `trusted_local_networks_egress` security group. Do this by running `cf bind-security-group trusted_local_networks_egress ORG --space SPACE` with your organization and space. Skipping this step will result in a `connection refused` error. For more, see [cloud.gov: Controlling egress traffic](https://cloud.gov/docs/management/space-egress/).
+> If you are using this tool to connect to a service on cloud.gov, the app's
+> space must be configured with the `trusted_local_networks_egress` security
+> group. Run `cf bind-security-group trusted_local_networks_egress APP_ORG
+> --space APP_SPACE`. Skipping this step will result in a `connection refused`
+> error. For more, see [cloud.gov: Controlling egress
+> traffic](https://cloud.gov/docs/management/space-egress/).
 
-* `app_name` is the name of the app in your space you want to tunnel through.
-* `service_instance_name` is the service instance you wish to connect to.
+The app and service can each be identified in one of three forms:
+
+* `name` uses the currently targeted organization and space.
+* `space/name` uses the named space in the currently targeted organization.
+* `org/space/name` uses the named organization and space.
+
+The two arguments are resolved independently, so the app used as the SSH relay
+does not need to be in the same space or organization as the service. Both must
+belong to the currently targeted Cloud Foundry foundation. Your user must be
+able to access both locations, and the app space's application security groups
+must allow egress to the service host and port.
 
 ```shell
 $ cf target --organization <org> --space <space>
-$ cf connect-to-service <app_name> <service_instance_name>
+$ cf connect-to-service <app> <service>
+$ cf connect-to-service <app-space>/<app> <service-space>/<service>
+$ cf connect-to-service <app-org>/<app-space>/<app> <service-org>/<service-space>/<service>
 Finding the service instance details...
 Creating the service key...
 Setting up SSH tunnel...
@@ -115,7 +131,7 @@ first argument. Install it and invoke it through `cf`:
 ```sh
 go build -o cf-service-connect
 cf install-plugin -f ./cf-service-connect
-cf connect-to-service <app_name> <service_instance_name>
+cf connect-to-service <app_reference> <service_reference>
 ```
 
 **`The SSH proxy rejected the one-time passcode`** — the SSH proxy asks the Cloud
@@ -130,7 +146,10 @@ retries incomplete credentials for up to five minutes before failing and
 deleting the temporary key. Each credential request is limited to ten seconds,
 so a blocked request does not consume the entire retry period. MongoDB
 credentials that expose a `Hosts` array instead of a single `host` are also
-supported; the tunnel targets the first listed host.
+supported; when multiple hosts are present, the plugin prompts you to choose the
+tunnel destination before opening the SSH tunnel. When the broker URI enables
+TLS, the MongoDB client is started with `--tls --tlsAllowInvalidHostnames`
+because the local tunnel hostname cannot match the remote certificate.
 
 **`connection refused`, `error opening SSH connection`, or
 `psql: could not connect to server: Connection refused`** — this is usually caused by being on a network that blocks the SSH port that this tool is trying to use. Try using a different network, or consider asking your network administrator to unblock the port (typically 22 and/or 2222). On foundations that advertise the `app_ssh_ws` endpoint the plugin tunnels SSH over `wss://` on port 443 instead, which avoids this class of problem.
@@ -146,12 +165,28 @@ supported; the tunnel targets the first listed host.
 Previously, in Windows or another environment where the Cloud Foundry CLI was installed as `cf7` or `cf8`, this variable told the plugin which binary name to use:
 
 ```shell
-CF_BINARY_NAME=cf7 cf connect-to-service <app_name> <service_instance_name>
+CF_BINARY_NAME=cf7 cf connect-to-service <app_reference> <service_reference>
 ```
 
 ### Manual client connection
 
 If you're using a non-default client (such as a GUI), run with the `-no-client` option to set up your client connection on your own.
+
+### Reusing the service key
+
+Pass `--keep-service-key` to leave the `SERVICE_CONNECT` key in place when the
+connection closes. Later runs with the same option reuse that key instead of
+waiting for the broker to create another one:
+
+```sh
+cf connect-to-service --keep-service-key <app_reference> <service_reference>
+```
+
+Remove it when it is no longer needed:
+
+```sh
+cf delete-service-key -f <service_name> SERVICE_CONNECT
+```
 
 ## Contributing
 

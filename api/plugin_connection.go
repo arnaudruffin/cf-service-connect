@@ -26,6 +26,14 @@ func (p pluginConnection) IsSSLDisabled() (bool, error) {
 	return p.cliConnection.IsSSLDisabled()
 }
 
+func (p pluginConnection) GetCurrentOrg() (Organization, error) {
+	organization, err := p.cliConnection.GetCurrentOrg()
+	if err != nil {
+		return Organization{}, err
+	}
+	return Organization{Guid: organization.Guid, Name: organization.Name}, nil
+}
+
 func (p pluginConnection) GetCurrentSpace() (Space, error) {
 	space, err := p.cliConnection.GetCurrentSpace()
 	if err != nil {
